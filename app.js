@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '8.3.14';
+const APP_VERSION = '9.0';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -467,7 +467,7 @@ function updateMetrics() {
 function buildingEligibility(d = null) {
   if (!rawSelection) return { ok:false, reason:'Zuerst ein Gebiet wählen.' };
   d = d || modelDimensions();
-  if (Math.abs(d.angleDeg || 0) > 1e-6) return { ok:false, reason:'Gebäude sind in v8.3.10 nur bei Nordausrichtung (0°) freigeschaltet, damit der stabile v0.6.17-Gebäudecode unverändert bleibt.' };
+  if (Math.abs(d.angleDeg || 0) > 1e-6) return { ok:false, reason:'Gebäude sind in v9.0 vorerst nur bei Nordausrichtung (0°) freigeschaltet, damit der stabile v0.6.17-Gebäudecode unverändert bleibt.' };
   const scale = d.groundW * 1000 / d.widthMm;
   const areaKm2 = d.groundW * d.groundH / 1e6;
   const typicalWidthMm = BUILDING_TYPICAL_WIDTH_M * d.mmPerMeter;
@@ -2126,7 +2126,7 @@ async function loadBuildingTriangles(t) {
       if(disjoint) continue;
       const inside=minX>=bx0-eps && maxX<=bx1+eps && minY>=by0-eps && maxY<=by1+eps;
 
-      // v8.3.14: Gebäude werden ab hier NICHT mehr künstlich geschlossen,
+      // v9.0: Gebäude werden ab hier NICHT mehr künstlich geschlossen,
       // repariert oder als separater STL-Körper ausgegeben. Wir übernehmen die
       // originale sichtbare swissBUILDINGS3D-Oberfläche. Der finale Export
       // erzeugt daraus robuste nach unten geschlossene Dachprismen und vereinigt
@@ -2510,10 +2510,9 @@ function buildTerrainIndexedSolid(t) {
   const w=t.dims.widthMm, h=t.dims.depthMm;
   const clip=roundedRectPolygon(w,h);
   const verts=[];
-  const tris=[];
+  const topTris=[];
   const gridRef=new Int32Array(cols*rows); gridRef.fill(-1);
   const boundaryRef=new Map();
-  const boundaryEdges=[];
 
   const addVertex=(p)=>{
     const i=verts.length/3;
@@ -2532,18 +2531,33 @@ function buildTerrainIndexedSolid(t) {
     gridRef[k]=id;
     return id;
   };
-  const bkey=(p)=>`${Math.round(p[0]*1e6)},${Math.round(p[1]*1e6)},${Math.round(p[2]*1e6)}`;
+
+  // Schnittpunkte auf dem Reliefumriss werden absichtlich NUR über XY
+  // verschweisst. Derselbe geometrische Randpunkt kann von zwei benachbarten
+  // Geländedreiecken mit winzig unterschiedlichen Float-Z-Werten berechnet
+  // werden. Würde Z Bestandteil des Schlüssels sein, entstünden dort zwei
+  // getrennte Vertices und damit offene Kanten.
+  const boundaryKey=(p)=>`${Math.round(p[0]*1e5)},${Math.round(p[1]*1e5)}`;
   const boundaryVertex=(p)=>{
-    const k=bkey(p);
+    const k=boundaryKey(p);
     if(boundaryRef.has(k)) return boundaryRef.get(k);
     const id=addVertex(p);
     boundaryRef.set(k,id);
     return id;
   };
-  const same=(a,b)=>Math.abs(a[0]-b[0])<1e-8&&Math.abs(a[1]-b[1])<1e-8&&Math.abs(a[2]-b[2])<1e-8;
+  const sameXY=(a,b)=>Math.abs(a[0]-b[0])<1e-9 && Math.abs(a[1]-b[1])<1e-9;
   const polyVertex=(p,src)=>{
-    for(const q of src) if(same(p,q.p)) return gridVertex(q.r,q.c);
+    for(const q of src) if(sameXY(p,q.p)) return gridVertex(q.r,q.c);
     return boundaryVertex(p);
+  };
+  const pushTri=(a,b,c)=>{
+    if(a===b||b===c||c===a) return;
+    const ax=verts[a*3], ay=verts[a*3+1], az=verts[a*3+2];
+    const bx=verts[b*3], by=verts[b*3+1], bz=verts[b*3+2];
+    const cx=verts[c*3], cy=verts[c*3+1], cz=verts[c*3+2];
+    const ux=bx-ax,uy=by-ay,uz=bz-az, vx=cx-ax,vy=cy-ay,vz=cz-az;
+    if(Math.hypot(uy*vz-uz*vy,uz*vx-ux*vz,ux*vy-uy*vx)<1e-12) return;
+    topTris.push(a,b,c);
   };
 
   for(let r=0;r<rows-1;r++) for(let c=0;c<cols-1;c++){
@@ -2551,67 +2565,88 @@ function buildTerrainIndexedSolid(t) {
     const q01={r:r+1,c,p:gridPoint(r+1,c)}, q11={r:r+1,c:c+1,p:gridPoint(r+1,c+1)};
     for(const src of [[q00,q01,q10],[q10,q01,q11]]){
       const pts=src.map(q=>q.p);
-      if(pts.every(p=>pointInsideRoundedRect(p[0],p[1],w,h))){
-        tris.push(gridVertex(src[0].r,src[0].c),gridVertex(src[1].r,src[1].c),gridVertex(src[2].r,src[2].c));
-        for(const [A,B] of clippedPolyBoundaryEdges(pts,clip)){
-          const ia=polyVertex(A,src), ib=polyVertex(B,src);
-          boundaryEdges.push([ia,ib]);
-        }
-        continue;
-      }
-      const poly=clipPolyAgainstConvexXY(pts,clip);
+      let poly;
+      if(pts.every(p=>pointInsideRoundedRect(p[0],p[1],w,h))) poly=pts;
+      else poly=clipPolyAgainstConvexXY(pts,clip);
       if(poly.length<3) continue;
-      const ids=poly.map(p=>polyVertex(p,src));
-      for(let i=1;i<ids.length-1;i++) tris.push(ids[0],ids[i],ids[i+1]);
-      for(const [A,B] of clippedPolyBoundaryEdges(poly,clip)){
-        boundaryEdges.push([polyVertex(A,src),polyVertex(B,src)]);
+
+      // Aufeinanderfolgende Doppelvertices aus dem Clipper entfernen.
+      const clean=[];
+      for(const p of poly){
+        if(!clean.length || !sameXY(p,clean[clean.length-1])) clean.push(p);
       }
+      if(clean.length>2 && sameXY(clean[0],clean[clean.length-1])) clean.pop();
+      if(clean.length<3) continue;
+
+      const ids=clean.map(p=>polyVertex(p,src));
+      for(let i=1;i<ids.length-1;i++) pushTri(ids[0],ids[i],ids[i+1]);
     }
   }
 
-  // Exakte Terrain-Randkontur aus denselben Kanten bilden, die bereits die
-  // Oberseite begrenzen. Seitenwand UND Boden verwenden anschließend exakt
-  // diese Punkte. Damit existieren am unteren Relief-Rand keine T-Junctions.
-  const edgeSeen=new Set(), edges=[];
-  for(const [a,b] of boundaryEdges){
-    if(a===b) continue;
+  // Der Relief-Rand wird NICHT separat rekonstruiert. Er wird direkt aus der
+  // fertigen Oberflächen-Topologie abgeleitet: Randkante = exakt eine angrenzende
+  // Top-Fläche. Damit teilen Oberseite und Seitenwand zwingend dieselben Vertices.
+  const edgeUse=new Map();
+  const addEdge=(a,b)=>{
     const k=a<b?`${a}|${b}`:`${b}|${a}`;
-    if(edgeSeen.has(k)) continue;
-    edgeSeen.add(k); edges.push([a,b]);
+    const e=edgeUse.get(k);
+    if(e) e.count++;
+    else edgeUse.set(k,{a,b,count:1});
+  };
+  for(let i=0;i<topTris.length;i+=3){
+    const a=topTris[i],b=topTris[i+1],c=topTris[i+2];
+    addEdge(a,b);addEdge(b,c);addEdge(c,a);
   }
+  const boundaryEdges=[...edgeUse.values()].filter(e=>e.count===1).map(e=>[e.a,e.b]);
+  const internalBad=[...edgeUse.values()].filter(e=>e.count>2).length;
+  if(internalBad) throw new Error(`Relief-Oberfläche intern nicht 2-manifold: ${internalBad} mehrfach belegte Oberflächenkanten.`);
+
+  // Eine einzige geschlossene Randkontur wird erwartet (konvexes abgerundetes
+  // Rechteck). Jede Randvertex muss Grad 2 besitzen.
   const adj=new Map();
   const addAdj=(a,b)=>{ if(!adj.has(a)) adj.set(a,[]); adj.get(a).push(b); };
-  for(const [a,b] of edges){ addAdj(a,b); addAdj(b,a); }
-  let start=null;
-  for(const [k,v] of adj){ if(v.length===2){ start=k; break; } }
-  if(start==null) throw new Error('Relief-Randkontur konnte nicht aufgebaut werden.');
-  const loop=[start];
-  let prev=null,curr=start,guard=0;
-  while(guard++<edges.length+10){
-    const ns=adj.get(curr)||[];
-    const next=ns.find(n=>n!==prev);
-    if(next==null) break;
-    if(next===start) break;
-    loop.push(next); prev=curr; curr=next;
+  for(const [a,b] of boundaryEdges){addAdj(a,b);addAdj(b,a);}
+  for(const [v,ns] of adj){
+    const unique=[...new Set(ns)];
+    adj.set(v,unique);
+    if(unique.length!==2) throw new Error(`Relief-Randtopologie ungültig: Vertex ${v} hat Grad ${unique.length} statt 2.`);
   }
-  if(loop.length<3) throw new Error('Relief-Randkontur ist unvollständig.');
+  if(!adj.size) throw new Error('Relief-Randkontur fehlt.');
+
+  const start=adj.keys().next().value;
+  const loop=[start];
+  let prev=-1,curr=start;
+  for(let guard=0;guard<=boundaryEdges.length+1;guard++){
+    const ns=adj.get(curr);
+    const next=ns[0]===prev?ns[1]:ns[0];
+    if(next===start) break;
+    if(loop.includes(next)) throw new Error('Relief-Randkontur kreuzt oder wiederholt sich.');
+    loop.push(next);prev=curr;curr=next;
+  }
+  if(loop.length!==boundaryEdges.length) throw new Error(`Relief-Randkontur unvollständig: ${loop.length} Vertices für ${boundaryEdges.length} Randkanten.`);
+
+  // Orientierung in XY auf CCW normalisieren.
   let area=0;
   for(let i=0;i<loop.length;i++){
     const a=loop[i],b=loop[(i+1)%loop.length];
-    const ax=verts[a*3], ay=verts[a*3+1], bx=verts[b*3], by=verts[b*3+1];
-    area += ax*by-bx*ay;
+    area += verts[a*3]*verts[b*3+1]-verts[b*3]*verts[a*3+1];
   }
   if(area<0) loop.reverse();
 
+  const tris=topTris.slice();
   const bottom=[];
-  for(const ti of loop){
-    bottom.push(addVertex([verts[ti*3],verts[ti*3+1],0]));
-  }
+  for(const ti of loop) bottom.push(addVertex([verts[ti*3],verts[ti*3+1],0]));
+
+  // Seitenwand: jede Top-Randkante wird exakt einmal mit ihrem eigenen
+  // Bottom-Gegenstück verbunden.
   for(let i=0;i<loop.length;i++){
     const j=(i+1)%loop.length;
-    const A=loop[i], B=loop[j], a=bottom[i], b=bottom[j];
+    const A=loop[i],B=loop[j],a=bottom[i],b=bottom[j];
     tris.push(A,a,B, B,a,b);
   }
+
+  // Der Umriss ist konvex (abgerundetes Rechteck), daher ist ein gemeinsamer
+  // Zentrumspunkt eine garantiert lückenlose Bodentriangulation ohne T-Junctions.
   const center=addVertex([0,0,0]);
   for(let i=0;i<bottom.length;i++){
     const j=(i+1)%bottom.length;
@@ -2621,7 +2656,7 @@ function buildTerrainIndexedSolid(t) {
   const triArray=new Uint32Array(tris);
   const check=validateIndexedManifold(triArray);
   if(!check.ok) throw new Error(`Relief-Grundkörper intern ungültig: ${check.open} offene / ${check.multi} mehrfach belegte Kanten.`);
-  return {vertProperties:new Float32Array(verts),triVerts:triArray,check};
+  return {vertProperties:new Float32Array(verts),triVerts:triArray,check,boundaryVertices:loop.length};
 }
 
 function trianglePrismMesh(A,B,C,baseZ,Mesh){
@@ -2716,7 +2751,7 @@ function manifoldMeshToBinaryStl(mesh){
 async function buildBinaryStl(t, buildingTriangles = null) {
   setStatus('Geschlossenen Reliefkörper aufbauen', 99);
   const terrainMeshData=buildTerrainIndexedSolid(t);
-  debug(`Relief-Topologie vor CAD-Union: manifold · ${terrainMeshData.check.edges.toLocaleString('de-CH')} Kanten, keine T-Junctions am Bodenrand.`);
+  debug(`Relief-Topologie vor CAD-Union: MANIFOLD · 0 offene · 0 mehrfach belegte Kanten · ${terrainMeshData.boundaryVertices.toLocaleString('de-CH')} gemeinsame Randvertices für Oberfläche/Seitenwand/Boden.`);
 
   const wasm=await getManifoldModule();
   const {Manifold,Mesh}=wasm;

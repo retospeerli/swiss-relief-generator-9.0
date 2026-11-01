@@ -1,10 +1,11 @@
-## v8.3.14
+## v9.0
 
-- Exportarchitektur neu: Relief und Gebäude werden vor dem STL-Export als echte Volumenkörper vereinigt.
-- Keine überlappenden Gebäude-/Terrain-Schalen mehr. swissBUILDINGS³D liefert nur die sichtbaren Oberflächen; daraus werden geschlossene Dachprismen bis unter das Terrain erzeugt.
-- Finale boolesche Union mit `manifold-3d` 3.5.4; die STL stammt ausschließlich aus dem resultierenden manifold Volumenkörper.
-- Reliefboden und Seitenwand verwenden exakt dieselbe vollständige Randkontur; damit entfallen T-Junctions an den unteren Kanten.
-- Frühere Gebäude-Reparatur-/Verwerfungslogik ist nicht mehr Teil des Exportpfads.
+- Neue Versionsreihe 9.
+- Relief-Grundkörper topologisch neu aufgebaut: Die Randkontur wird ausschließlich aus den tatsächlichen Randkanten der fertig triangulierten Geländeoberfläche abgeleitet.
+- Schnittvertices am 5-mm-Eckenradius werden global über XY verschweisst; benachbarte Geländedreiecke können dadurch keine getrennten Randvertices mehr erzeugen.
+- Oberfläche, Seitenwand und Boden verwenden exakt dieselben Randvertices. Der Grundkörper muss intern 0 offene und 0 mehrfach belegte Kanten besitzen.
+- Exportarchitektur: Relief und Gebäude werden vor dem STL-Export als Volumenkörper vereinigt; finale Ausgabe über `manifold-3d` 3.5.4.
+- Keine nachträgliche Kanten-Reparatur des Reliefgrundkörpers.
 
 ## v8.3.13
 
