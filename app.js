@@ -1,0 +1,2855 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/loaders/DRACOLoader.js';
+
+const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
+const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
+const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
+const APP_VERSION = '8.3.14';
+const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
+const MAX_TILES = 1600;
+const MAX_STAC_PAGES = 120;
+const TILE_CONCURRENCY = 6;
+const REQUEST_RETRIES = 3;
+const RETRY_BASE_MS = 450;
+const BUILDINGS_TILESET = 'https://3d.geo.admin.ch/ch.swisstopo.swissbuildings3d.3d/v1/tileset.json';
+const BUILDING_MAX_SCALE = 15000;
+const BUILDING_MAX_AREA_KM2 = 60;
+const BUILDING_MIN_TYPICAL_WIDTH_MM = 0.55;
+const BUILDING_TYPICAL_WIDTH_M = 8;
+const BUILDING_MIN_TYPICAL_HEIGHT_MM = 0.8;
+const BUILDING_TYPICAL_HEIGHT_M = 10;
+const BUILDING_MAX_TRIANGLES = 1500000;
+
+const APP_DATASETS = 'swissALTI³D · swissALTIRegio · swissBUILDINGS³D';
+const APP_SOURCE = 'swisstopo';
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  generateBtn: $('generateBtn'), downloadBtn: $('downloadBtn'), clearBtn: $('clearBtn'), resetViewBtn: $('resetViewBtn'),
+  sourceResolution: $('sourceResolution'), selectionShape: $('selectionShape'), ratioW: $('ratioW'), ratioH: $('ratioH'), rotationDeg: $('rotationDeg'), fixedScaleEnabled: $('fixedScaleEnabled'), mapScale: $('mapScale'), modelWidth: $('modelWidth'), modelDepth: $('modelDepth'), baseThickness: $('baseThickness'),
+  zExaggeration: $('zExaggeration'), gridSize: $('gridSize'), smoothMissing: $('smoothMissing'), includeBuildings: $('includeBuildings'), buildingEligibility: $('buildingEligibility'),
+  selectionInfo: $('selectionInfo'), metrics: $('metrics'), statusText: $('statusText'), statusPct: $('statusPct'),
+  progress: $('progress'), preview: $('preview'), resultInfo: $('resultInfo'), debug: $('debug'),
+  placeSearchInput: $('placeSearchInput'), placeSearchBtn: $('placeSearchBtn'), placeSearchResults: $('placeSearchResults')
+};
+
+const versionEl = $('appVersion');
+if (versionEl) versionEl.textContent = `v${APP_VERSION}`;
+document.title = `Swiss Relief STL Generator v${APP_VERSION} · ${APP_DATASETS} · Quelle: ${APP_SOURCE}`;
+
+let selectedBounds = null;
+let selectedLayer = null;
+let rawSelection = null;
+let selectionState = null;
+let terrain = null;
+let lastStlBlob = null;
+let renderer, scene, camera, controls, terrainGroup;
+let lastBuildingTriangles = null;
+let lastBuildingMeta = null;
+let TilesRendererClass = null;
+let CsgModulePromise = null;
+let BufferUtilsPromise = null;
+let ManifoldModulePromise = null;
+let centerHandle = null;
+let rotateHandle = null;
+let rotateGuide = null;
+
+async function getTilesRendererClass() {
+  if (TilesRendererClass) return TilesRendererClass;
+  try {
+    // Gebäudecode darf die Grund-App niemals blockieren. Dieses Modul wird erst
+    // geladen, wenn Gebäude ausdrücklich aktiviert wurden. esm.sh löst die
+    // Paketabhängigkeiten browsergerecht auf; THREE bleibt über die Importmap extern.
+    const mod = await import('https://esm.sh/3d-tiles-renderer@0.5.3?external=three');
+    TilesRendererClass = mod.TilesRenderer;
+    if (!TilesRendererClass) throw new Error('TilesRenderer-Export fehlt');
+    return TilesRendererClass;
+  } catch (err) {
+    throw new Error(`Gebäudemodul konnte nicht geladen werden: ${err?.message || err}`);
+  }
+}
+
+// CH1903+ / LV95 (EPSG:2056). proj4 contains the transformation logic; definition is explicit for portability.
+proj4.defs('EPSG:2056', '+proj=somerc +lat_0=46.95240555555556 +lon_0=7.439583333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +towgs84=674.374,15.056,405.346,0,0,0,0 +units=m +no_defs');
+
+const map = L.map('map', { zoomControl: true }).setView([46.82, 8.23], 8);
+L.tileLayer('https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.pixelkarte-farbe/default/current/3857/{z}/{x}/{y}.jpeg', {
+  maxZoom: 19,
+  attribution: '© swisstopo'
+}).addTo(map);
+
+
+const LOCATION_SEARCH_URL = 'https://api3.geo.admin.ch/rest/services/ech/SearchServer';
+let placeSearchMarker = null;
+let placeSearchAbort = null;
+
+function plainSearchLabel(html) {
+  const el = document.createElement('div');
+  el.innerHTML = String(html || '');
+  return (el.textContent || el.innerText || '').replace(/\s+/g, ' ').trim();
+}
+
+function hidePlaceSearchResults() {
+  if (!els.placeSearchResults) return;
+  els.placeSearchResults.hidden = true;
+  els.placeSearchResults.innerHTML = '';
+}
+
+function showPlaceSearchMessage(message) {
+  if (!els.placeSearchResults) return;
+  els.placeSearchResults.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'place-search-message';
+  div.textContent = message;
+  els.placeSearchResults.appendChild(div);
+  els.placeSearchResults.hidden = false;
+}
+
+function focusSearchResult(attrs) {
+  const lat = Number(attrs.lat), lon = Number(attrs.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  let zoom = Number(attrs.zoomlevel);
+  if (!Number.isFinite(zoom) || zoom < 6 || zoom > 18) zoom = 14;
+  zoom = Math.max(12, Math.min(17, zoom));
+  map.setView([lat, lon], zoom, { animate: true });
+  if (placeSearchMarker) map.removeLayer(placeSearchMarker);
+  placeSearchMarker = L.circleMarker([lat, lon], {
+    radius: 7, weight: 2, color: '#b82025', fillColor: '#ffffff', fillOpacity: 0.95
+  }).addTo(map);
+  hidePlaceSearchResults();
+}
+
+function renderPlaceSearchResults(results) {
+  if (!els.placeSearchResults) return;
+  els.placeSearchResults.innerHTML = '';
+  if (!results.length) {
+    showPlaceSearchMessage('Kein passender Ort oder Flurname gefunden.');
+    return;
+  }
+  for (const result of results.slice(0, 12)) {
+    const attrs = result.attrs || {};
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'place-search-result';
+    const strong = document.createElement('strong');
+    strong.textContent = plainSearchLabel(attrs.label) || attrs.detail || 'Treffer';
+    button.appendChild(strong);
+    const detail = plainSearchLabel(attrs.detail);
+    const originLabels = {
+      gazetteer: 'Flurname / geografischer Name', gg25: 'Gemeinde / Ort', kantone: 'Kanton',
+      district: 'Bezirk', zipcode: 'PLZ / Ort', address: 'Adresse'
+    };
+    const meta = [originLabels[attrs.origin] || attrs.origin, detail && detail.toLowerCase() !== strong.textContent.toLowerCase() ? detail : ''].filter(Boolean).join(' · ');
+    if (meta) {
+      const small = document.createElement('small');
+      small.textContent = meta;
+      button.appendChild(small);
+    }
+    button.addEventListener('click', () => focusSearchResult(attrs));
+    els.placeSearchResults.appendChild(button);
+  }
+  els.placeSearchResults.hidden = false;
+}
+
+async function searchPlace() {
+  if (!els.placeSearchInput) return;
+  const q = els.placeSearchInput.value.trim();
+  if (q.length < 2) {
+    showPlaceSearchMessage('Mindestens 2 Zeichen eingeben.');
+    return;
+  }
+  if (placeSearchAbort) placeSearchAbort.abort();
+  placeSearchAbort = new AbortController();
+  showPlaceSearchMessage('Suche …');
+  try {
+    const params = new URLSearchParams({
+      searchText: q,
+      type: 'locations',
+      origins: 'gazetteer,gg25,kantone,district,zipcode,address',
+      limit: '20',
+      sr: '4326',
+      lang: 'de'
+    });
+    const res = await fetch(`${LOCATION_SEARCH_URL}?${params}`, { signal: placeSearchAbort.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderPlaceSearchResults(Array.isArray(data.results) ? data.results : []);
+  } catch (err) {
+    if (err?.name === 'AbortError') return;
+    showPlaceSearchMessage(`Suche nicht verfügbar: ${err?.message || err}`);
+  }
+}
+
+els.placeSearchBtn?.addEventListener('click', searchPlace);
+els.placeSearchInput?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); searchPlace(); }
+  if (e.key === 'Escape') hidePlaceSearchResults();
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#placeSearch')) hidePlaceSearchResults();
+});
+
+const drawnItems = new L.FeatureGroup().addTo(map);
+const drawControl = new L.Control.Draw({
+  draw: { polygon: false, polyline: false, circle: false, circlemarker: false, marker: false, rectangle: { shapeOptions: { color: '#b82025', weight: 2 } } },
+  edit: { featureGroup: drawnItems, edit: false, remove: false }
+});
+map.addControl(drawControl);
+
+map.on(L.Draw.Event.CREATED, (e) => {
+  drawnItems.clearLayers();
+  const bounds = e.layer.getBounds();
+  const ext = projectedExtent(bounds);
+  rawSelection = { centerX: (ext.minX + ext.maxX) / 2, centerY: (ext.minY + ext.maxY) / 2, groundW: ext.maxX - ext.minX, groundH: ext.maxY - ext.minY };
+  selectedLayer = null;
+  terrain = null;
+  lastStlBlob = null;
+  lastBuildingTriangles = null;
+  lastBuildingMeta = null;
+  els.downloadBtn.disabled = true;
+  updateSelectionUI();
+});
+
+els.clearBtn.addEventListener('click', () => {
+  drawnItems.clearLayers();
+  hideSelectionHandles();
+  selectedBounds = null;
+  selectedLayer = null;
+  rawSelection = null;
+  selectionState = null;
+  terrain = null;
+  lastStlBlob = null;
+  lastBuildingTriangles = null;
+  lastBuildingMeta = null;
+  els.generateBtn.disabled = true;
+  els.downloadBtn.disabled = true;
+  els.selectionInfo.textContent = 'Noch kein Gebiet gewählt.';
+  els.resultInfo.textContent = '';
+  updateMetrics();
+updateBuildingEligibility();
+  clearPreview();
+});
+
+['input','change'].forEach(evt => {
+  [els.selectionShape, els.ratioW, els.ratioH, els.rotationDeg, els.fixedScaleEnabled, els.mapScale, els.modelWidth, els.modelDepth, els.baseThickness, els.zExaggeration, els.gridSize, els.sourceResolution, els.includeBuildings].forEach(el => el.addEventListener(evt, () => {
+    if (rawSelection) updateSelectionUI();
+    else updateMetrics();
+    if (lastStlBlob) {
+      lastStlBlob = null;
+      lastBuildingTriangles = null;
+      lastBuildingMeta = null;
+      els.downloadBtn.disabled = true;
+      els.resultInfo.textContent = 'Einstellungen geändert – Relief bitte neu erzeugen.';
+    }
+  }));
+});
+
+els.generateBtn.addEventListener('click', generateTerrain);
+els.downloadBtn.addEventListener('click', downloadStl);
+els.resetViewBtn.addEventListener('click', resetCamera);
+window.addEventListener('resize', resizePreview);
+
+function lv95FromLonLat(lon, lat) {
+  return proj4('EPSG:4326', 'EPSG:2056', [lon, lat]);
+}
+
+function lonLatFromLv95(x, y) {
+  return proj4('EPSG:2056', 'EPSG:4326', [x, y]);
+}
+
+function projectedExtent(bounds) {
+  const corners = [
+    [bounds.getWest(), bounds.getSouth()], [bounds.getEast(), bounds.getSouth()],
+    [bounds.getEast(), bounds.getNorth()], [bounds.getWest(), bounds.getNorth()]
+  ].map(([lon,lat]) => lv95FromLonLat(lon,lat));
+  return {
+    minX: Math.min(...corners.map(p => p[0])), maxX: Math.max(...corners.map(p => p[0])),
+    minY: Math.min(...corners.map(p => p[1])), maxY: Math.max(...corners.map(p => p[1]))
+  };
+}
+
+function normalizeAngleDeg(v) {
+  let a = Number(v) || 0;
+  while (a > 180) a -= 360;
+  while (a < -180) a += 360;
+  return a;
+}
+
+function ratioValues() {
+  const rw = Math.max(1, Number(els.ratioW?.value) || 1);
+  const rh = Math.max(1, Number(els.ratioH?.value) || 1);
+  return { rw, rh, ratio: rw / rh };
+}
+
+function effectiveModelSizeMm(shape = null) {
+  shape = shape || els.selectionShape?.value || 'free';
+  if (els.ratioW) els.ratioW.disabled = shape !== 'ratio';
+  if (els.ratioH) els.ratioH.disabled = shape !== 'ratio';
+  if (els.mapScale) els.mapScale.disabled = !els.fixedScaleEnabled?.checked;
+  const widthMm = Math.max(1, Number(els.modelWidth.value) || 220);
+  let depthMm = Math.max(1, Number(els.modelDepth?.value) || 165);
+  if (shape === 'square') depthMm = widthMm;
+  else if (shape === 'ratio') {
+    const { rw, rh } = ratioValues();
+    depthMm = widthMm * rh / rw;
+  }
+  if (els.modelDepth) {
+    els.modelDepth.value = depthMm.toFixed(depthMm % 1 ? 1 : 0);
+    els.modelDepth.disabled = shape !== 'free';
+  }
+  return { widthMm, depthMm };
+}
+
+function selectionSizeFromRaw(raw) {
+  if (!raw) return null;
+  let groundW = raw.groundW, groundH = raw.groundH;
+  const shape = els.selectionShape?.value || 'free';
+  if (shape === 'square') {
+    const side = Math.max(groundW, groundH);
+    groundW = side;
+    groundH = side;
+  } else if (shape === 'ratio') {
+    const { ratio } = ratioValues();
+    if (groundW / groundH >= ratio) groundH = groundW / ratio;
+    else groundW = groundH * ratio;
+  }
+  return { groundW, groundH };
+}
+
+function getSelectionState() {
+  if (!rawSelection) return null;
+  const { widthMm, depthMm } = effectiveModelSizeMm();
+  let { groundW, groundH } = selectionSizeFromRaw(rawSelection);
+  if (els.fixedScaleEnabled?.checked) {
+    const scale = Math.max(100, Number(els.mapScale?.value) || 25000);
+    groundW = widthMm * scale / 1000;
+    groundH = depthMm * scale / 1000;
+  }
+  const angleDeg = normalizeAngleDeg(els.rotationDeg?.value);
+  return { centerX: rawSelection.centerX, centerY: rawSelection.centerY, groundW, groundH, angleDeg, widthMm, depthMm };
+}
+
+function localGroundToWorld(d, lx, ly) {
+  const a = d.angleRad || 0;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  return { x: d.centerX + lx * ca - ly * sa, y: d.centerY + lx * sa + ly * ca };
+}
+
+function worldToLocalGround(d, x, y) {
+  const dx = x - d.centerX, dy = y - d.centerY;
+  const a = d.angleRad || 0;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  return { lx: dx * ca + dy * sa, ly: -dx * sa + dy * ca };
+}
+
+function gridPointWorld(d, grid, c, r) {
+  const fx = grid.cols <= 1 ? 0 : c / (grid.cols - 1);
+  const fy = grid.rows <= 1 ? 0 : r / (grid.rows - 1);
+  const lx = (fx - 0.5) * d.groundW;
+  const ly = (0.5 - fy) * d.groundH;
+  return localGroundToWorld(d, lx, ly);
+}
+
+function worldToGridFraction(d, grid, x, y) {
+  const { lx, ly } = worldToLocalGround(d, x, y);
+  const cf = (lx / d.groundW + 0.5) * (grid.cols - 1);
+  const rf = (0.5 - ly / d.groundH) * (grid.rows - 1);
+  return { cf, rf, lx, ly };
+}
+
+function selectionCornersWorld(state) {
+  const hw = state.groundW / 2, hh = state.groundH / 2;
+  return [
+    localGroundToWorld(state, -hw, hh),
+    localGroundToWorld(state, hw, hh),
+    localGroundToWorld(state, hw, -hh),
+    localGroundToWorld(state, -hw, -hh)
+  ];
+}
+
+function ensureSelectionHandles() {
+  const moveIcon = L.divIcon({ className:'relief-handle-wrap', html:'<div class="relief-handle move-handle" title="Ausschnitt verschieben">↕</div>', iconSize:[28,28], iconAnchor:[14,14] });
+  const rotateIcon = L.divIcon({ className:'relief-handle-wrap', html:'<div class="relief-handle rotate-handle" title="Ausschnitt drehen">↻</div>', iconSize:[28,28], iconAnchor:[14,14] });
+  if (!centerHandle) {
+    centerHandle = L.marker([0,0], { draggable:true, icon:moveIcon, keyboard:false, zIndexOffset:1200 }).addTo(map);
+    centerHandle.on('drag', (e) => {
+      if (!rawSelection) return;
+      const ll=e.target.getLatLng();
+      const [x,y]=lv95FromLonLat(ll.lng,ll.lat);
+      rawSelection.centerX=x; rawSelection.centerY=y;
+      updateSelectionUI();
+    });
+  }
+  if (!rotateHandle) {
+    rotateHandle = L.marker([0,0], { draggable:true, icon:rotateIcon, keyboard:false, zIndexOffset:1200 }).addTo(map);
+    rotateHandle.on('drag', (e) => {
+      if (!rawSelection) return;
+      const ll=e.target.getLatLng();
+      const [x,y]=lv95FromLonLat(ll.lng,ll.lat);
+      const dx=x-rawSelection.centerX, dy=y-rawSelection.centerY;
+      if (Math.hypot(dx,dy)<1) return;
+      const angle=normalizeAngleDeg(Math.atan2(dy,dx)*180/Math.PI-90);
+      els.rotationDeg.value=angle.toFixed(1);
+      updateSelectionUI();
+    });
+  }
+  if (!rotateGuide) rotateGuide=L.polyline([], { color:'#b82025', weight:1.5, dashArray:'5,5', interactive:false }).addTo(map);
+}
+
+function hideSelectionHandles() {
+  for (const layer of [centerHandle, rotateHandle, rotateGuide]) if (layer && map.hasLayer(layer)) map.removeLayer(layer);
+  centerHandle=null; rotateHandle=null; rotateGuide=null;
+}
+
+function refreshSelectionOverlay() {
+  if (!rawSelection) return;
+  selectionState = getSelectionState();
+  const state={ ...selectionState, angleRad: selectionState.angleDeg * Math.PI / 180 };
+  const corners = selectionCornersWorld(state);
+  const latlngs = corners.map(p => { const ll = lonLatFromLv95(p.x, p.y); return [ll[1], ll[0]]; });
+  selectedBounds = L.latLngBounds(latlngs);
+  if (selectedLayer) drawnItems.removeLayer(selectedLayer);
+  selectedLayer = L.polygon(latlngs, { color: '#b82025', weight: 2, fillOpacity: 0.08 }).addTo(drawnItems);
+
+  ensureSelectionHandles();
+  const centerLL=lonLatFromLv95(state.centerX,state.centerY);
+  centerHandle.setLatLng([centerLL[1],centerLL[0]]);
+  const handleOffset=Math.max(state.groundH*0.65, 40);
+  const rp=localGroundToWorld(state,0,handleOffset);
+  const rll=lonLatFromLv95(rp.x,rp.y);
+  rotateHandle.setLatLng([rll[1],rll[0]]);
+  rotateGuide.setLatLngs([[centerLL[1],centerLL[0]],[rll[1],rll[0]]]);
+}
+
+function modelDimensions() {
+  if (!rawSelection) return null;
+  selectionState = getSelectionState();
+  const angleRad = selectionState.angleDeg * Math.PI / 180;
+  const d = { ...selectionState, angleRad, mmPerMeter: selectionState.widthMm / selectionState.groundW };
+  const corners = selectionCornersWorld(d);
+  d.corners = corners;
+  d.minX = Math.min(...corners.map(p => p.x));
+  d.maxX = Math.max(...corners.map(p => p.x));
+  d.minY = Math.min(...corners.map(p => p.y));
+  d.maxY = Math.max(...corners.map(p => p.y));
+  return d;
+}
+
+function updateSelectionUI() {
+  if (!rawSelection) return;
+  refreshSelectionOverlay();
+  const d = modelDimensions();
+  const areaKm2 = d.groundW * d.groundH / 1e6;
+  const mode = els.fixedScaleEnabled?.checked ? ` · 1:${Math.round(Number(els.mapScale.value)||25000).toLocaleString('de-CH')}` : '';
+  els.selectionInfo.textContent = `${(d.groundW/1000).toFixed(2)} × ${(d.groundH/1000).toFixed(2)} km · ca. ${areaKm2.toFixed(1)} km² · Drehung ${d.angleDeg.toFixed(1)}°${mode} · Mittelpunkt ziehen = verschieben · ↻ ziehen = drehen`;
+  els.generateBtn.disabled = false;
+  updateMetrics();
+}
+
+function updateMetrics() {
+  const rows = els.metrics.querySelectorAll('b');
+  if (!rawSelection) { rows.forEach(x => x.textContent = '–'); return; }
+  const d = modelDimensions();
+  const maxN = Number(els.gridSize.value);
+  const cols = d.groundW >= d.groundH ? maxN : Math.max(2, Math.round(maxN * d.groundW / d.groundH));
+  const rowsN = d.groundH >= d.groundW ? maxN : Math.max(2, Math.round(maxN * d.groundH / d.groundW));
+  const spacing = d.widthMm / Math.max(1, cols - 1);
+  const tri = 2 * (cols - 1) * (rowsN - 1) + 2 * ((cols - 1) + (rowsN - 1)) + 2;
+  rows[0].textContent = `${d.widthMm.toFixed(0)} × ${d.depthMm.toFixed(1)} mm`;
+  rows[1].textContent = `1 : ${Math.round(d.groundW * 1000 / d.widthMm).toLocaleString('de-CH')}`;
+  rows[2].textContent = `${spacing.toFixed(3)} mm`;
+  rows[3].textContent = `${(tri/1e6).toFixed(2)} Mio.`;
+  updateBuildingEligibility(d);
+}
+
+function buildingEligibility(d = null) {
+  if (!rawSelection) return { ok:false, reason:'Zuerst ein Gebiet wählen.' };
+  d = d || modelDimensions();
+  if (Math.abs(d.angleDeg || 0) > 1e-6) return { ok:false, reason:'Gebäude sind in v8.3.10 nur bei Nordausrichtung (0°) freigeschaltet, damit der stabile v0.6.17-Gebäudecode unverändert bleibt.' };
+  const scale = d.groundW * 1000 / d.widthMm;
+  const areaKm2 = d.groundW * d.groundH / 1e6;
+  const typicalWidthMm = BUILDING_TYPICAL_WIDTH_M * d.mmPerMeter;
+  if (scale > BUILDING_MAX_SCALE || typicalWidthMm < BUILDING_MIN_TYPICAL_WIDTH_MM) {
+    return { ok:false, scale, areaKm2, reason:`Massstab zu klein: ca. 1:${Math.round(scale).toLocaleString('de-CH')}. Gebäude werden bis etwa 1:${BUILDING_MAX_SCALE.toLocaleString('de-CH')} freigeschaltet.` };
+  }
+  if (areaKm2 > BUILDING_MAX_AREA_KM2) {
+    return { ok:false, scale, areaKm2, reason:`Fläche zu gross (${areaKm2.toFixed(1)} km²). Für Gebäude maximal ${BUILDING_MAX_AREA_KM2} km² wählen.` };
+  }
+  return { ok:true, scale, areaKm2, typicalWidthMm, reason:`Geeignet: ca. 1:${Math.round(scale).toLocaleString('de-CH')} · typische 8-m-Gebäudebreite ≈ ${typicalWidthMm.toFixed(2)} mm.` };
+}
+
+function updateBuildingEligibility(d = null) {
+  if (!els.includeBuildings || !els.buildingEligibility) return;
+  const e = buildingEligibility(d);
+  els.includeBuildings.disabled = !e.ok;
+  if (!e.ok && els.includeBuildings.checked) els.includeBuildings.checked = false;
+  els.buildingEligibility.textContent = e.reason;
+  els.buildingEligibility.className = `building-hint ${e.ok ? 'ok' : 'warn'}`;
+}
+
+function setStatus(text, pct = null) {
+  els.statusText.textContent = text;
+  if (pct == null) { els.statusPct.textContent = ''; return; }
+  const v = Math.max(0, Math.min(100, pct));
+  els.progress.value = v;
+  els.statusPct.textContent = `${Math.round(v)} %`;
+}
+
+function debug(text) {
+  els.debug.textContent += `${text}\n`;
+  els.debug.scrollTop = els.debug.scrollHeight;
+}
+
+function stacBbox(bounds) {
+  return [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()].map(v => v.toFixed(8)).join(',');
+}
+
+// IMPORTANT: the STL grid is an axis-aligned LV95 rectangle. A Leaflet/WGS84
+// rectangle transformed to LV95 is not exactly the same area. Query STAC from
+// the actual LV95 model rectangle, otherwise narrow uncovered strips can appear
+// at the model edges. Padding is in metres and only affects catalogue discovery.
+function stacBboxForDims(d, paddingM = 100) {
+  const corners = [
+    [d.minX - paddingM, d.minY - paddingM],
+    [d.maxX + paddingM, d.minY - paddingM],
+    [d.maxX + paddingM, d.maxY + paddingM],
+    [d.minX - paddingM, d.maxY + paddingM]
+  ].map(([x, y]) => lonLatFromLv95(x, y));
+  const lons = corners.map(p => p[0]);
+  const lats = corners.map(p => p[1]);
+  return [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)]
+    .map(v => v.toFixed(8)).join(',');
+}
+
+async function fetchStacItemsForBbox(bboxString, itemsUrl = STAC_ITEMS, label = 'STAC-Katalog') {
+  let url = `${itemsUrl}?bbox=${encodeURIComponent(bboxString)}&limit=100`;
+  const all = [];
+  let page = 0;
+  while (url && page < MAX_STAC_PAGES) {
+    page++;
+    setStatus(`${label} abfragen · Seite ${page}`, Math.min(12, page));
+    const r = await fetchWithRetry(url, { cache: 'no-cache' });
+    const json = await r.json();
+    all.push(...(json.features || []));
+    if (all.length > 12000) throw new Error('Zu viele STAC-Einträge. Bitte einen kleineren Ausschnitt wählen.');
+    const next = (json.links || []).find(l => l.rel === 'next');
+    url = next?.href ? new URL(next.href, itemsUrl).href : null;
+  }
+  if (page >= MAX_STAC_PAGES && url) throw new Error('Sehr grosser Ausschnitt: STAC-Seitenlimit erreicht. Bitte Gebiet verkleinern.');
+  return all;
+}
+
+function tileKey(item) {
+  const m = String(item.id || '').match(/(\d{4}-\d{4})$/);
+  if (m) return m[1];
+  const b = item.bbox || [];
+  return b.length >= 4 ? b.map(v => Number(v).toFixed(5)).join('/') : item.id;
+}
+
+function itemYear(item) {
+  const dt = item.properties?.datetime || item.properties?.start_datetime || '';
+  const y = Number(String(dt).slice(0,4));
+  if (Number.isFinite(y)) return y;
+  const m = String(item.id || '').match(/_(\d{4})_/);
+  return m ? Number(m[1]) : 0;
+}
+
+function findGeoTiffAsset(item, resolution) {
+  const assets = Object.values(item.assets || {});
+  const candidates = assets.filter(a => {
+    const href = String(a.href || '');
+    const type = String(a.type || '').toLowerCase();
+    const gsd = Number(a['eo:gsd']);
+    const isTif = /\.tiff?(?:$|\?)/i.test(href) || type.includes('geotiff') || type.includes('image/tiff');
+    return isTif && Math.abs(gsd - resolution) < 1e-9;
+  });
+  if (candidates.length) return candidates[0];
+  // Fallback for older metadata where eo:gsd may be absent.
+  const token = resolution === 0.5 ? '_0.5_' : '_2_';
+  return assets.find(a => /\.tiff?(?:$|\?)/i.test(String(a.href || '')) && String(a.href).includes(token)) || null;
+}
+
+function groupTileCandidates(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const key = tileKey(item);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  for (const arr of groups.values()) arr.sort((a, b) => itemYear(b) - itemYear(a));
+  return groups;
+}
+
+function makeTilePlans(items, preferredResolution) {
+  const groups = groupTileCandidates(items);
+  const fallbackResolution = preferredResolution === 0.5 ? 2 : 0.5;
+  const plans = [];
+  for (const [key, versions] of groups) {
+    // v8.3.8: pro räumlicher Kachel genau EINE deterministische Primärquelle.
+    // Niemals wegen eines temporären Downloadfehlers auf einen älteren Jahrgang
+    // wechseln: genau dieses Mischen kann rechteckige Kachelunterschiede erzeugen.
+    let chosen = null;
+    for (const item of versions) {
+      const asset = findGeoTiffAsset(item, preferredResolution);
+      if (asset) { chosen = { item, asset, resolution: preferredResolution }; break; }
+    }
+    // Nur wenn für diese räumliche Kachel die gewünschte Auflösung überhaupt
+    // nicht publiziert ist, darf die alternative Auflösung als feste Primärquelle
+    // verwendet werden. Auch dann nur der neueste verfügbare Stand.
+    if (!chosen) {
+      for (const item of versions) {
+        const asset = findGeoTiffAsset(item, fallbackResolution);
+        if (asset) { chosen = { item, asset, resolution: fallbackResolution }; break; }
+      }
+    }
+    if (chosen) plans.push({ key, candidates: [chosen], primary: chosen });
+  }
+  return plans;
+}
+
+function chooseAutomaticResolution(d, grid) {
+  const sx = d.groundW / Math.max(1, grid.cols - 1);
+  const sy = d.groundH / Math.max(1, grid.rows - 1);
+  const meshGroundSpacing = Math.max(sx, sy);
+  // 2 m source is still comfortably finer than a mesh with >= 4 m spacing.
+  // This reduces a typical tile from ~26 MB to ~1 MB without reducing STL detail.
+  return meshGroundSpacing >= 4 ? 2 : 0.5;
+}
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function fetchWithRetry(url, options = {}, retries = REQUEST_RETRIES) {
+  let lastErr;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const r = await fetch(url, options);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r;
+    } catch (err) {
+      lastErr = err;
+      if (attempt + 1 < retries) await sleep(RETRY_BASE_MS * (2 ** attempt));
+    }
+  }
+  throw lastErr || new Error('Download fehlgeschlagen');
+}
+
+function outputGrid(d) {
+  const maxN = Number(els.gridSize.value);
+  let cols, rows;
+  if (d.groundW >= d.groundH) {
+    cols = maxN;
+    rows = Math.max(2, Math.round(maxN * d.groundH / d.groundW));
+  } else {
+    rows = maxN;
+    cols = Math.max(2, Math.round(maxN * d.groundW / d.groundH));
+  }
+  return {
+    cols, rows,
+    values: new Float32Array(cols * rows).fill(NaN),
+    sums: new Float64Array(cols * rows),
+    counts: new Uint16Array(cols * rows)
+  };
+}
+
+function indexRangeForTile(tileBox, d, grid) {
+  const overlap = {
+    minX: Math.max(tileBox[0], d.minX), minY: Math.max(tileBox[1], d.minY),
+    maxX: Math.min(tileBox[2], d.maxX), maxY: Math.min(tileBox[3], d.maxY)
+  };
+  if (overlap.maxX <= overlap.minX || overlap.maxY <= overlap.minY) return null;
+  const pts=[
+    [overlap.minX,overlap.minY],[overlap.maxX,overlap.minY],
+    [overlap.maxX,overlap.maxY],[overlap.minX,overlap.maxY]
+  ].map(([x,y])=>worldToGridFraction(d,grid,x,y));
+  let c0=Math.floor(Math.min(...pts.map(p=>p.cf)))-2;
+  let c1=Math.ceil(Math.max(...pts.map(p=>p.cf)))+2;
+  let r0=Math.floor(Math.min(...pts.map(p=>p.rf)))-2;
+  let r1=Math.ceil(Math.max(...pts.map(p=>p.rf)))+2;
+  if(c1<0||c0>grid.cols-1||r1<0||r0>grid.rows-1) return null;
+  c0=Math.max(0,c0); c1=Math.min(grid.cols-1,c1);
+  r0=Math.max(0,r0); r1=Math.min(grid.rows-1,r1);
+  return {c0,c1,r0,r1};
+}
+
+async function sampleTile(url, d, grid, resolution = 2, options = {}) {
+  const { onlyMissing = false, forceRange = false } = options;
+  let tiff;
+  // 2 m COGs are small enough to download completely. 0.5 m COGs continue
+  // to use HTTP range access so a large landscape remains practical.
+  if (resolution >= 2 && !forceRange) {
+    const response = await fetchWithRetry(url, { cache: 'force-cache' });
+    const buffer = await response.arrayBuffer();
+    tiff = await GeoTIFF.fromArrayBuffer(buffer);
+  } else {
+    let lastErr;
+    for (let attempt = 0; attempt < REQUEST_RETRIES; attempt++) {
+      try {
+        tiff = await GeoTIFF.fromUrl(url, { allowFullFile: false, cacheSize: 64 * 1024 * 1024 });
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (attempt + 1 < REQUEST_RETRIES) await sleep(RETRY_BASE_MS * (2 ** attempt));
+      }
+    }
+    if (!tiff) throw lastErr || new Error('GeoTIFF konnte nicht geöffnet werden');
+  }
+
+  try {
+    const image = await tiff.getImage();
+    const box = image.getBoundingBox(); // pixel-edge bbox [minX,minY,maxX,maxY]
+    const ir = indexRangeForTile(box, d, grid);
+    if (!ir) return 0;
+
+    const imgW = image.getWidth(), imgH = image.getHeight();
+    const resX = (box[2] - box[0]) / imgW;
+    const resY = (box[3] - box[1]) / imgH;
+
+    // Read native pixels around the required output points. Do NOT ask
+    // GeoTIFF.js to resize every tile independently: independent resize grids
+    // are the main cause of visible 1-km seams in the final terrain.
+    const subsetCorners = [gridPointWorld(d, grid, ir.c0, ir.r0), gridPointWorld(d, grid, ir.c1, ir.r0), gridPointWorld(d, grid, ir.c1, ir.r1), gridPointWorld(d, grid, ir.c0, ir.r1)];
+    const xMin = Math.min(...subsetCorners.map(p => p.x));
+    const xMax = Math.max(...subsetCorners.map(p => p.x));
+    const yMin = Math.min(...subsetCorners.map(p => p.y));
+    const yMax = Math.max(...subsetCorners.map(p => p.y));
+
+    // Pixel centres are half a pixel inside the bounding box. Keep a small
+    // native-pixel halo for bilinear interpolation right across tile edges.
+    const px0f = (xMin - box[0]) / resX - 0.5;
+    const px1f = (xMax - box[0]) / resX - 0.5;
+    const py0f = (box[3] - yMax) / resY - 0.5;
+    const py1f = (box[3] - yMin) / resY - 0.5;
+    const wx0 = Math.max(0, Math.floor(Math.min(px0f, px1f)) - 2);
+    const wx1 = Math.min(imgW, Math.ceil(Math.max(px0f, px1f)) + 3);
+    const wy0 = Math.max(0, Math.floor(Math.min(py0f, py1f)) - 2);
+    const wy1 = Math.min(imgH, Math.ceil(Math.max(py0f, py1f)) + 3);
+    if (wx1 <= wx0 || wy1 <= wy0) return 0;
+
+    const data = await image.readRasters({
+      window: [wx0, wy0, wx1, wy1], samples: [0], interleave: true
+    });
+    const srcW = wx1 - wx0, srcH = wy1 - wy0;
+    const noDataRaw = image.getGDALNoData();
+    const noData = noDataRaw == null ? null : Number(noDataRaw);
+
+    const valid = (v) => Number.isFinite(v) && !(noData != null && Math.abs(v - noData) < 1e-6) && v >= -1000;
+    const at = (x, y) => {
+      x = Math.max(0, Math.min(srcW - 1, x));
+      y = Math.max(0, Math.min(srcH - 1, y));
+      return Number(data[y * srcW + x]);
+    };
+
+    const bilinearAtMap = (x, y) => {
+      // Convert the exact global LV95 coordinate to native pixel-centre space.
+      const px = (x - box[0]) / resX - 0.5 - wx0;
+      const py = (box[3] - y) / resY - 0.5 - wy0;
+      const x0 = Math.floor(px), y0 = Math.floor(py);
+      const tx = px - x0, ty = py - y0;
+      const v00 = at(x0, y0), v10 = at(x0 + 1, y0);
+      const v01 = at(x0, y0 + 1), v11 = at(x0 + 1, y0 + 1);
+      if (valid(v00) && valid(v10) && valid(v01) && valid(v11)) {
+        const a = v00 * (1 - tx) + v10 * tx;
+        const b = v01 * (1 - tx) + v11 * tx;
+        return a * (1 - ty) + b * ty;
+      }
+      // Near a NoData edge use the nearest valid native sample instead of
+      // inventing a low value that could create a trench.
+      const nearest = [v00, v10, v01, v11].filter(valid);
+      return nearest.length ? nearest.reduce((a,b) => a+b, 0) / nearest.length : NaN;
+    };
+
+    let written = 0;
+    for (let r = ir.r0; r <= ir.r1; r++) {
+      for (let c = ir.c0; c <= ir.c1; c++) {
+        const pt = gridPointWorld(d, grid, c, r);
+        const x = pt.x, y = pt.y;
+        if (x < box[0] - 1e-6 || x > box[2] + 1e-6 || y < box[1] - 1e-6 || y > box[3] + 1e-6) continue;
+        const v = bilinearAtMap(x, y);
+        if (!valid(v)) continue;
+        const gi = r * grid.cols + c;
+        if (onlyMissing && Number.isFinite(grid.values[gi])) continue;
+        const wasMissing = grid.counts[gi] === 0;
+        grid.sums[gi] += v;
+        grid.counts[gi] += 1;
+        grid.values[gi] = grid.sums[gi] / grid.counts[gi];
+        if (wasMissing) written++;
+      }
+    }
+    return written;
+  } finally {
+    if (typeof tiff?.close === 'function') tiff.close();
+  }
+}
+
+async function loadTilePlan(plan, d, grid) {
+  const errors = [];
+  const candidate = plan.candidates[0];
+  if (!candidate) return { written: 0, candidate: null, errors:['keine Primärquelle'] };
+  // Mehrfach dieselbe Quelle versuchen. Kein Jahrgangs-/Auflösungswechsel nach
+  // Netzfehlern. Lieber Generation abbrechen als verschiedene Terrainstände mischen.
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const written = await sampleTile(candidate.asset.href, d, grid, candidate.resolution);
+      if (written > 0) return { written, candidate, errors };
+      errors.push(`${candidate.item.id} (${candidate.resolution} m), Versuch ${attempt}: kein Überlappungsbereich`);
+      break;
+    } catch (err) {
+      errors.push(`${candidate.item.id} (${candidate.resolution} m), Versuch ${attempt}: ${err.message}`);
+      if (attempt < 4) await sleep(650 * attempt);
+    }
+  }
+  return { written: 0, candidate: null, errors };
+}
+
+async function loadPlansConcurrent(plans, d, grid, progressCb) {
+  let next = 0, done = 0, totalWritten = 0;
+  const failed = [];
+  const fallbackUsed = [];
+
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= plans.length) return;
+      const plan = plans[i];
+      const result = await loadTilePlan(plan, d, grid);
+      totalWritten += result.written;
+      if (!result.candidate) failed.push({ plan, errors: result.errors });
+      else if (result.candidate !== plan.candidates[0]) fallbackUsed.push(result.candidate);
+      done++;
+      progressCb(done, plans.length);
+      if (done % 12 === 0) await sleep(0);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(TILE_CONCURRENCY, plans.length) }, () => worker());
+  await Promise.all(workers);
+  return { totalWritten, failed, fallbackUsed };
+}
+
+function fillSmallGaps(grid, passes = 12) {
+  const { cols, rows } = grid;
+  let src = grid.values;
+  let totalChanged = 0;
+  for (let pass = 0; pass < passes; pass++) {
+    let changed = 0;
+    const dst = new Float32Array(src);
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+      const i = r * cols + c;
+      if (Number.isFinite(src[i])) continue;
+      let sum = 0, n = 0;
+      for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+        if (!dr && !dc) continue;
+        const rr = r + dr, cc = c + dc;
+        if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) continue;
+        const v = src[rr * cols + cc];
+        if (Number.isFinite(v)) { sum += v; n++; }
+      }
+      if (n >= 4) { dst[i] = sum / n; changed++; }
+    }
+    src = dst;
+    totalChanged += changed;
+    if (!changed) break;
+  }
+  grid.values = src;
+  return totalChanged;
+}
+
+// Robust post-check for systematic vertical offsets between neighbouring
+// 1-km swissALTI³D tiles. This is intentionally NOT a blur: a whole affected
+// tile receives one small rigid Z correction derived from both sides of its
+// shared seam. True local slope is estimated independently on each side.
+function gridElevationAtWorld(grid, d, x, y) {
+  const { cf, rf, lx, ly } = worldToGridFraction(d, grid, x, y);
+  if (Math.abs(lx) > d.groundW/2 + 1e-6 || Math.abs(ly) > d.groundH/2 + 1e-6) return NaN;
+  if (cf < 0 || rf < 0 || cf > grid.cols-1 || rf > grid.rows-1) return NaN;
+  const c0=Math.floor(cf), r0=Math.floor(rf);
+  const c1=Math.min(grid.cols-1,c0+1), r1=Math.min(grid.rows-1,r0+1);
+  const tx=cf-c0, ty=rf-r0;
+  const v00=grid.values[r0*grid.cols+c0], v10=grid.values[r0*grid.cols+c1];
+  const v01=grid.values[r1*grid.cols+c0], v11=grid.values[r1*grid.cols+c1];
+  if (![v00,v10,v01,v11].every(Number.isFinite)) return NaN;
+  return (v00*(1-tx)+v10*tx)*(1-ty) + (v01*(1-tx)+v11*tx)*ty;
+}
+
+function robustMedian(values) {
+  if (!values.length) return NaN;
+  const a=values.slice().sort((x,y)=>x-y);
+  const m=Math.floor(a.length/2);
+  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
+}
+
+function tileNodeKey(tx,ty){ return `${tx},${ty}`; }
+
+function estimateTileSeamConstraints(grid, d) {
+  const sx=d.groundW/Math.max(1,grid.cols-1), sy=d.groundH/Math.max(1,grid.rows-1);
+  const meshM=Math.max(sx,sy);
+  const delta=Math.max(4,Math.min(65,meshM*2.25));
+  const sampleStep=Math.max(65,Math.min(180,delta*3.0));
+  const constraints=[];
+  const minTx=Math.floor(d.minX/1000)-1, maxTx=Math.floor(d.maxX/1000)+1;
+  const minTy=Math.floor(d.minY/1000)-1, maxTy=Math.floor(d.maxY/1000)+1;
+
+  const accept=(a,b,errs,axis,seamCoord)=>{
+    if(errs.length<4) return;
+    const med=robustMedian(errs);
+    const mad=robustMedian(errs.map(v=>Math.abs(v-med)));
+    const abs=Math.abs(med);
+    // Below 8 cm is irrelevant for a printed relief. Above 1.75 m is much
+    // more likely real terrain / incompatible source and is deliberately not
+    // auto-corrected. A coherent seam has low scatter along its shared edge.
+    if(abs < 0.08 || abs > 1.75) return;
+    if(mad > Math.max(0.22, abs*0.75)) return;
+    constraints.push({a,b,target:-med,measured:med,mad,n:errs.length,axis,seamCoord,weight:errs.length/Math.max(0.06,mad+0.04)});
+  };
+
+  // Vertical 1-km seams: left tile -> right tile.
+  for(let tx=minTx;tx<maxTx;tx++){
+    const x=(tx+1)*1000;
+    if(x<=d.minX+2*delta || x>=d.maxX-2*delta) continue;
+    for(let ty=minTy;ty<=maxTy;ty++){
+      const y0=Math.max(d.minY+2*delta,ty*1000+2*delta);
+      const y1=Math.min(d.maxY-2*delta,(ty+1)*1000-2*delta);
+      if(y1<=y0) continue;
+      const errs=[];
+      for(let y=y0;y<=y1+1e-6;y+=sampleStep){
+        const l1=gridElevationAtWorld(grid,d,x-delta,y), l2=gridElevationAtWorld(grid,d,x-2*delta,y);
+        const r1=gridElevationAtWorld(grid,d,x+delta,y), r2=gridElevationAtWorld(grid,d,x+2*delta,y);
+        if([l1,l2,r1,r2].every(Number.isFinite)) errs.push((2*r1-r2)-(2*l1-l2));
+      }
+      accept(tileNodeKey(tx,ty),tileNodeKey(tx+1,ty),errs,'x',x);
+    }
+  }
+  // Horizontal 1-km seams: lower tile -> upper tile.
+  for(let ty=minTy;ty<maxTy;ty++){
+    const y=(ty+1)*1000;
+    if(y<=d.minY+2*delta || y>=d.maxY-2*delta) continue;
+    for(let tx=minTx;tx<=maxTx;tx++){
+      const x0=Math.max(d.minX+2*delta,tx*1000+2*delta);
+      const x1=Math.min(d.maxX-2*delta,(tx+1)*1000-2*delta);
+      if(x1<=x0) continue;
+      const errs=[];
+      for(let x=x0;x<=x1+1e-6;x+=sampleStep){
+        const b1=gridElevationAtWorld(grid,d,x,y-delta), b2=gridElevationAtWorld(grid,d,x,y-2*delta);
+        const t1=gridElevationAtWorld(grid,d,x,y+delta), t2=gridElevationAtWorld(grid,d,x,y+2*delta);
+        if([b1,b2,t1,t2].every(Number.isFinite)) errs.push((2*t1-t2)-(2*b1-b2));
+      }
+      accept(tileNodeKey(tx,ty),tileNodeKey(tx,ty+1),errs,'y',y);
+    }
+  }
+  return {constraints,delta,meshM};
+}
+
+function solveTileCorrections(constraints, d) {
+  if(!constraints.length) return new Map();
+  const neighbours=new Map();
+  const add=(k,rec)=>{ if(!neighbours.has(k)) neighbours.set(k,[]); neighbours.get(k).push(rec); };
+  for(const e of constraints){
+    // c_b - c_a = target
+    add(e.a,{other:e.b,delta:-e.target,w:e.weight}); // c_a = c_b - target
+    add(e.b,{other:e.a,delta:e.target,w:e.weight});  // c_b = c_a + target
+  }
+  const anchor=tileNodeKey(Math.floor(d.centerX/1000),Math.floor(d.centerY/1000));
+  const corr=new Map([...neighbours.keys()].map(k=>[k,0]));
+  if(!corr.has(anchor)) corr.set(anchor,0);
+  for(let iter=0;iter<120;iter++){
+    let maxChange=0;
+    const next=new Map(corr);
+    for(const [k,list] of neighbours){
+      if(k===anchor) { next.set(k,0); continue; }
+      let sum=0,ws=0;
+      for(const r of list){
+        if(!corr.has(r.other)) continue;
+        sum += (corr.get(r.other)+r.delta)*r.w;
+        ws += r.w;
+      }
+      if(!ws) continue;
+      const v=Math.max(-1.75,Math.min(1.75,sum/ws));
+      maxChange=Math.max(maxChange,Math.abs(v-(corr.get(k)||0)));
+      next.set(k,v);
+    }
+    for(const [k,v] of next) corr.set(k,v);
+    if(maxChange<1e-5) break;
+  }
+  return corr;
+}
+
+function correctionAtWorld(corr, x, y, blendM) {
+  const tx=Math.floor(x/1000), ty=Math.floor(y/1000);
+  let base=corr.get(tileNodeKey(tx,ty)) || 0;
+  let sum=base, w=1;
+  const fx=x-tx*1000, fy=y-ty*1000;
+  const mix=(other,dist)=>{
+    if(dist>=blendM) return;
+    const k=tileNodeKey(other[0],other[1]);
+    if(!corr.has(k)) return;
+    const a=0.5*(1-dist/blendM); // exactly on seam -> equal 50/50
+    sum += (corr.get(k)||0)*a;
+    w += a;
+  };
+  mix([tx-1,ty],fx); mix([tx+1,ty],1000-fx);
+  mix([tx,ty-1],fy); mix([tx,ty+1],1000-fy);
+  return sum/w;
+}
+
+function harmonizeSwissAltiTileSeams(grid, d) {
+  const est=estimateTileSeamConstraints(grid,d);
+  if(!est.constraints.length) return {corrected:false,constraints:0,tiles:0,maxCorrection:0,details:[]};
+  const corr=solveTileCorrections(est.constraints,d);
+  const significant=[...corr.entries()].filter(([,v])=>Math.abs(v)>=0.04);
+  if(!significant.length) return {corrected:false,constraints:est.constraints.length,tiles:0,maxCorrection:0,details:est.constraints};
+  const blendM=Math.max(1.0,Math.min(30,est.meshM*0.85));
+  for(let r=0;r<grid.rows;r++) for(let c=0;c<grid.cols;c++){
+    const i=r*grid.cols+c;
+    if(!Number.isFinite(grid.values[i])) continue;
+    const pt=gridPointWorld(d,grid,c,r);
+    grid.values[i] += correctionAtWorld(corr,pt.x,pt.y,blendM);
+  }
+  const maxCorrection=Math.max(...significant.map(([,v])=>Math.abs(v)));
+  return {corrected:true,constraints:est.constraints.length,tiles:significant.length,maxCorrection,details:est.constraints};
+}
+
+// Missing-coverage recovery works in the same 1-km tile index system.
+function missingTileKeys(grid, d, neighbourRing = 1) {
+  const keys = new Set();
+  for (let r = 0; r < grid.rows; r++) {
+    for (let c = 0; c < grid.cols; c++) {
+      const i = r * grid.cols + c;
+      if (Number.isFinite(grid.values[i])) continue;
+      const pt = gridPointWorld(d, grid, c, r);
+      const x = pt.x;
+      const y = pt.y;
+      const tx = Math.floor(x / 1000);
+      const ty = Math.floor(y / 1000);
+      for (let dx = -neighbourRing; dx <= neighbourRing; dx++) {
+        for (let dy = -neighbourRing; dy <= neighbourRing; dy++) {
+          keys.add(`${tx + dx}-${ty + dy}`);
+        }
+      }
+    }
+  }
+  return keys;
+}
+
+async function recoverMissingCoverage(grid, d, preferredResolution, progressBase = 82) {
+  let stats = terrainStats(grid);
+  if (!stats.missing) return { passes: 0, recovered: 0, queried: 0 };
+  const before = stats.missing;
+  let queried = 0;
+
+  // A larger catalogue bbox guarantees that tiles intersecting the true LV95
+  // model rectangle are discoverable even close to projection/selection edges.
+  for (let pass = 1; pass <= 2 && stats.missing > 0; pass++) {
+    const needed = missingTileKeys(grid, d, 1);
+    const bbox = stacBboxForDims(d, pass === 1 ? 1600 : 2600);
+    setStatus(`Abdeckung vervollständigen · Durchgang ${pass}`, progressBase + pass * 2);
+    const items = await fetchStacItemsForBbox(bbox);
+    queried += items.length;
+    const plans = makeTilePlans(items, preferredResolution).filter(p => needed.has(p.key));
+    if (!plans.length) break;
+    await loadPlansConcurrent(plans, d, grid, () => {});
+    stats = terrainStats(grid);
+  }
+  return { passes: 2, recovered: before - stats.missing, queried };
+}
+
+function findAnyGeoTiffAsset(item) {
+  const assets = Object.values(item.assets || {});
+  const tiffs = assets.filter(a => {
+    const href = String(a.href || '');
+    const type = String(a.type || '').toLowerCase();
+    return /\.tiff?(?:$|\?)/i.test(href) || type.includes('geotiff') || type.includes('image/tiff');
+  });
+  return tiffs.find(a => /2056_5728/i.test(String(a.href || ''))) || tiffs[0] || null;
+}
+
+function findRegioXyzAssets(item) {
+  const out = [];
+  for (const [key, a] of Object.entries(item.assets || {})) {
+    const href = String(a?.href || '');
+    const type = String(a?.type || '').toLowerCase();
+    const title = String(a?.title || '');
+    const hay = `${key} ${href} ${type} ${title}`.toLowerCase();
+    // swissALTIRegio is distributed both as one huge COG and as 10×10-km
+    // ASCII XYZ tiles. Prefer the spatial XYZ tiles in a browser: they are
+    // finite downloads (~23 MB each) and avoid fragile cross-origin byte-range
+    // access to the ~12-GB national COG.
+    if (/\.xyz(?:\.zip)?(?:$|\?)/i.test(href) || (hay.includes('xyz') && (hay.includes('zip') || type.includes('text/plain')))) {
+      out.push(a);
+    }
+  }
+  return out;
+}
+
+function decodeRegioTextFromBytes(bytes, url) {
+  const isZip = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b;
+  if (!isZip) return new TextDecoder('utf-8').decode(bytes);
+  if (!globalThis.fflate?.unzipSync) throw new Error('ZIP-Dekompressor (fflate) nicht geladen');
+  const files = globalThis.fflate.unzipSync(bytes);
+  const entries = Object.entries(files)
+    .filter(([name, data]) => data?.length && !name.endsWith('/'))
+    .sort((a, b) => {
+      const ax = /\.(xyz|txt|asc)$/i.test(a[0]) ? 1 : 0;
+      const bx = /\.(xyz|txt|asc)$/i.test(b[0]) ? 1 : 0;
+      return (bx - ax) || (b[1].length - a[1].length);
+    });
+  if (!entries.length) throw new Error(`ZIP enthält keine XYZ-Datei: ${url}`);
+  return new TextDecoder('utf-8').decode(entries[0][1]);
+}
+
+function eachXyzLine(text, cb) {
+  let start = 0;
+  for (let i = 0; i <= text.length; i++) {
+    if (i !== text.length && text.charCodeAt(i) !== 10) continue;
+    let line = text.slice(start, i).trim();
+    start = i + 1;
+    if (!line || line[0] === '#') continue;
+    // Official files are whitespace separated; accepting commas/semicolons
+    // makes the fallback tolerant of future export variants.
+    const parts = line.split(/[\s,;]+/);
+    if (parts.length < 3) continue;
+    const x = Number(parts[0]), y = Number(parts[1]), z = Number(parts[2]);
+    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) cb(x, y, z);
+  }
+}
+
+async function sampleRegioXyzAsset(url, d, grid) {
+  const response = await fetchWithRetry(url, { cache: 'force-cache' });
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const text = decodeRegioTextFromBytes(bytes, url);
+
+  // Determine the actual regular 10-m tile bounds first. This avoids making
+  // assumptions from filenames and keeps the parser compatible with any
+  // official XYZ tile naming convention.
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, n = 0;
+  eachXyzLine(text, (x, y) => {
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y; n++;
+  });
+  if (!n || !Number.isFinite(minX)) throw new Error('XYZ-Datei enthält keine gültigen Höhenpunkte');
+  if (maxX < d.minX - 20 || minX > d.maxX + 20 || maxY < d.minY - 20 || minY > d.maxY + 20) return 0;
+
+  const step = 10;
+  const cols = Math.round((maxX - minX) / step) + 1;
+  const rows = Math.round((maxY - minY) / step) + 1;
+  if (cols < 2 || rows < 2 || cols * rows > 2_000_000) throw new Error(`Unerwartetes swissALTIRegio-XYZ-Raster ${cols}×${rows}`);
+  const src = new Float32Array(cols * rows);
+  src.fill(NaN);
+  eachXyzLine(text, (x, y, z) => {
+    const c = Math.round((x - minX) / step);
+    const r = Math.round((maxY - y) / step); // north to south
+    if (c >= 0 && c < cols && r >= 0 && r < rows) src[r * cols + c] = z;
+  });
+
+  const valid = v => Number.isFinite(v) && v >= -1000;
+  const at = (c, r) => {
+    c = Math.max(0, Math.min(cols - 1, c));
+    r = Math.max(0, Math.min(rows - 1, r));
+    return src[r * cols + c];
+  };
+  let written = 0;
+  for (let r = 0; r < grid.rows; r++) {
+    for (let c = 0; c < grid.cols; c++) {
+      const gi = r * grid.cols + c;
+      if (Number.isFinite(grid.values[gi])) continue;
+      const pt = gridPointWorld(d, grid, c, r);
+      const x = pt.x, y = pt.y;
+      if (x < minX - 1e-6 || x > maxX + 1e-6 || y < minY - 1e-6 || y > maxY + 1e-6) continue;
+      const rf = (maxY - y) / step;
+      const r0 = Math.floor(rf), ty = rf - r0;
+      const cf = (x - minX) / step;
+      const c0 = Math.floor(cf), tx = cf - c0;
+      const v00 = at(c0, r0), v10 = at(c0 + 1, r0), v01 = at(c0, r0 + 1), v11 = at(c0 + 1, r0 + 1);
+      let v = NaN;
+      if (valid(v00) && valid(v10) && valid(v01) && valid(v11)) {
+        const a = v00 * (1 - tx) + v10 * tx;
+        const b = v01 * (1 - tx) + v11 * tx;
+        v = a * (1 - ty) + b * ty;
+      } else {
+        const vals = [v00, v10, v01, v11].filter(valid);
+        if (vals.length) v = vals.reduce((a,b) => a+b, 0) / vals.length;
+      }
+      if (!valid(v)) continue;
+      grid.sums[gi] += v;
+      grid.counts[gi] += 1;
+      grid.values[gi] = grid.sums[gi] / grid.counts[gi];
+      written++;
+    }
+  }
+  return written;
+}
+
+async function recoverWithSwissAltiRegio(grid, d, progressBase = 91) {
+  const before = terrainStats(grid).missing;
+  if (!before) return { recovered: 0, items: 0, assetsTried: 0, xyzTried: 0, cogTried: 0 };
+  const bbox = stacBboxForDims(d, 1000);
+  setStatus('Grenzgebiet: swissALTIRegio-Fallback suchen', progressBase);
+  const items = await fetchStacItemsForBbox(bbox, REGIO_ITEMS, 'swissALTIRegio');
+
+  // First choice: official 10×10-km XYZ tiles. They are much more reliable
+  // from a static GitHub-Pages app than byte-range reads against the national COG.
+  const xyzCandidates = [];
+  const seenXyz = new Set();
+  for (const item of items) {
+    for (const asset of findRegioXyzAssets(item)) {
+      const href = String(asset.href || '');
+      if (!href || seenXyz.has(href)) continue;
+      seenXyz.add(href);
+      xyzCandidates.push({ item, asset });
+    }
+  }
+  xyzCandidates.sort((a, b) => itemYear(b.item) - itemYear(a.item));
+  let xyzTried = 0, cogTried = 0;
+  for (const candidate of xyzCandidates) {
+    if (!terrainStats(grid).missing) break;
+    xyzTried++;
+    try {
+      const added = await sampleRegioXyzAsset(candidate.asset.href, d, grid);
+      if (added) debug(`swissALTIRegio XYZ ${candidate.item.id || xyzTried}: ${added.toLocaleString('de-CH')} Punkte ergänzt.`);
+    } catch (err) {
+      debug(`swissALTIRegio XYZ ${candidate.item.id || xyzTried}: ${err.message}`);
+    }
+  }
+
+  // Last resort only: the single national COG. It is ~12 GB, so GeoTIFF.js
+  // must use HTTP range requests; some browser/CDN combinations reject them.
+  if (terrainStats(grid).missing) {
+    const cogCandidates = [];
+    const seenCog = new Set();
+    for (const item of items) {
+      const asset = findAnyGeoTiffAsset(item);
+      const href = String(asset?.href || '');
+      if (asset && href && !seenCog.has(href)) {
+        seenCog.add(href);
+        cogCandidates.push({ item, asset });
+      }
+    }
+    cogCandidates.sort((a, b) => itemYear(b.item) - itemYear(a.item));
+    for (const candidate of cogCandidates) {
+      if (!terrainStats(grid).missing) break;
+      cogTried++;
+      try {
+        await sampleTile(candidate.asset.href, d, grid, 10, { onlyMissing: true, forceRange: true });
+      } catch (err) {
+        debug(`swissALTIRegio COG ${candidate.item.id || cogTried}: ${err.message}`);
+      }
+    }
+  }
+  return {
+    recovered: before - terrainStats(grid).missing,
+    items: items.length,
+    assetsTried: xyzTried + cogTried,
+    xyzTried,
+    cogTried
+  };
+}
+
+function terrainStats(grid) {
+  let min = Infinity, max = -Infinity, missing = 0;
+  for (const v of grid.values) {
+    if (!Number.isFinite(v)) { missing++; continue; }
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  return { min, max, missing, total: grid.values.length };
+}
+
+
+function terrainElevationAtXY(t, x, y) {
+  const { cols, rows, values } = t.grid;
+  const d = t.dims;
+  const cf = (x - d.minX) / d.groundW * (cols - 1);
+  const rf = (d.maxY - y) / d.groundH * (rows - 1);
+  const c0 = Math.max(0, Math.min(cols - 1, Math.floor(cf)));
+  const r0 = Math.max(0, Math.min(rows - 1, Math.floor(rf)));
+  const c1 = Math.min(cols - 1, c0 + 1), r1 = Math.min(rows - 1, r0 + 1);
+  const tx = Math.max(0, Math.min(1, cf - c0)), ty = Math.max(0, Math.min(1, rf - r0));
+  const v00 = values[r0 * cols + c0], v10 = values[r0 * cols + c1];
+  const v01 = values[r1 * cols + c0], v11 = values[r1 * cols + c1];
+  return (v00 * (1-tx) + v10 * tx) * (1-ty) + (v01 * (1-tx) + v11 * tx) * ty;
+}
+
+function geodeticToEcef(lonDeg, latDeg, h = 0) {
+  const a = 6378137.0, e2 = 6.69437999014e-3;
+  const lon = lonDeg * Math.PI / 180, lat = latDeg * Math.PI / 180;
+  const sl = Math.sin(lat), cl = Math.cos(lat), so = Math.sin(lon), co = Math.cos(lon);
+  const N = a / Math.sqrt(1 - e2 * sl * sl);
+  return new THREE.Vector3((N+h)*cl*co, (N+h)*cl*so, (N*(1-e2)+h)*sl);
+}
+
+function ecefToGeodetic(x, y, z) {
+  const a = 6378137.0, e2 = 6.69437999014e-3, b = a * Math.sqrt(1-e2);
+  const ep2 = (a*a-b*b)/(b*b), p = Math.hypot(x,y);
+  const th = Math.atan2(a*z, b*p);
+  const sth=Math.sin(th), cth=Math.cos(th);
+  const lon=Math.atan2(y,x);
+  const lat=Math.atan2(z + ep2*b*sth*sth*sth, p - e2*a*cth*cth*cth);
+  const sl=Math.sin(lat), N=a/Math.sqrt(1-e2*sl*sl);
+  const h=p/Math.max(1e-12,Math.cos(lat))-N;
+  return [lon*180/Math.PI, lat*180/Math.PI, h];
+}
+
+function percentile(arr, q) {
+  if (!arr.length) return 0;
+  const a = arr.slice().sort((x,y)=>x-y);
+  const pos = Math.max(0, Math.min(a.length-1, Math.floor((a.length-1)*q)));
+  return a[pos];
+}
+
+
+function cloneClipVertex(v) {
+  return { x:v.x, y:v.y, p:[v.p[0], v.p[1], v.p[2]] };
+}
+
+function lerpClipVertex(a, b, t) {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    p: [
+      a.p[0] + (b.p[0] - a.p[0]) * t,
+      a.p[1] + (b.p[1] - a.p[1]) * t,
+      a.p[2] + (b.p[2] - a.p[2]) * t
+    ]
+  };
+}
+
+function makeBuildingClipPlanes(t) {
+  return [
+    { name:'xmin', axis:'x', coord:t.dims.minX, modelCoord:-t.dims.widthMm/2, keep:'ge', outward:'negx' },
+    { name:'xmax', axis:'x', coord:t.dims.maxX, modelCoord: t.dims.widthMm/2, keep:'le', outward:'posx' },
+    { name:'ymin', axis:'y', coord:t.dims.minY, modelCoord:-t.dims.depthMm/2, keep:'ge', outward:'negy' },
+    { name:'ymax', axis:'y', coord:t.dims.maxY, modelCoord: t.dims.depthMm/2, keep:'le', outward:'posy' }
+  ];
+}
+
+function clipInsidePlane(v, plane, eps = 1e-9) {
+  return plane.keep === 'ge' ? v[plane.axis] >= plane.coord - eps : v[plane.axis] <= plane.coord + eps;
+}
+
+function clipPolygonAgainstPlane(poly, plane, segmentsOut) {
+  if (!poly.length) return poly;
+  const out = [];
+  const intersections = [];
+  let prev = poly[poly.length - 1];
+  let prevIn = clipInsidePlane(prev, plane);
+  for (const curr of poly) {
+    const currIn = clipInsidePlane(curr, plane);
+    if (currIn !== prevIn) {
+      const denom = (curr[plane.axis] - prev[plane.axis]);
+      const t = Math.abs(denom) < 1e-12 ? 0 : (plane.coord - prev[plane.axis]) / denom;
+      const inter = lerpClipVertex(prev, curr, Math.max(0, Math.min(1, t)));
+      inter[plane.axis] = plane.coord;
+      if (plane.axis === 'x') inter.p[0] = plane.modelCoord;
+      else inter.p[1] = plane.modelCoord;
+      intersections.push(inter);
+      out.push(inter);
+    }
+    if (currIn) out.push(curr);
+    prev = curr; prevIn = currIn;
+  }
+  if (intersections.length === 2) segmentsOut.push([intersections[0], intersections[1]]);
+  return out;
+}
+
+function pointKey2D(v, plane, scale = 10000) {
+  const u = plane.axis === 'x' ? v.p[1] : v.p[0];
+  const w = v.p[2];
+  return `${Math.round(u * scale)}:${Math.round(w * scale)}`;
+}
+
+function buildCapLoopsFromSegments(segments, plane) {
+  const nodeMap = new Map();
+  const edges = [];
+  const addNode = (v) => {
+    const key = pointKey2D(v, plane);
+    if (!nodeMap.has(key)) nodeMap.set(key, { key, pt:v, edges:[] });
+    return nodeMap.get(key);
+  };
+  for (const seg of segments) {
+    const a = addNode(seg[0]), b = addNode(seg[1]);
+    if (a.key === b.key) continue;
+    const edge = { a:a.key, b:b.key, used:false };
+    const idx = edges.push(edge) - 1;
+    a.edges.push(idx); b.edges.push(idx);
+  }
+  const loops = [];
+  for (let i = 0; i < edges.length; i++) {
+    if (edges[i].used) continue;
+    const first = edges[i];
+    first.used = true;
+    let startKey = first.a;
+    let prevKey = first.a;
+    let currKey = first.b;
+    const loop = [nodeMap.get(startKey).pt, nodeMap.get(currKey).pt];
+    let guard = 0;
+    while (currKey !== startKey && guard++ < 10000) {
+      const node = nodeMap.get(currKey);
+      if (!node) break;
+      const nextEdgeIdx = node.edges.find(ei => !edges[ei].used && ((edges[ei].a === currKey && edges[ei].b !== prevKey) || (edges[ei].b === currKey && edges[ei].a !== prevKey)))
+        ?? node.edges.find(ei => !edges[ei].used);
+      if (nextEdgeIdx == null) break;
+      const e = edges[nextEdgeIdx];
+      e.used = true;
+      const nextKey = e.a === currKey ? e.b : e.a;
+      if (nextKey !== startKey) loop.push(nodeMap.get(nextKey).pt);
+      prevKey = currKey;
+      currKey = nextKey;
+    }
+    if (currKey === startKey && loop.length >= 3) loops.push(loop);
+  }
+  return loops;
+}
+
+function appendCapTrianglesForPlane(out, segments, plane) {
+  let count = 0;
+  const loops = buildCapLoopsFromSegments(segments, plane);
+  for (const loop of loops) {
+    const contour = loop.map(v => plane.axis === 'x' ? new THREE.Vector2(v.p[1], v.p[2]) : new THREE.Vector2(v.p[0], v.p[2]));
+    const tris = THREE.ShapeUtils.triangulateShape(contour, []);
+    for (const tri of tris) {
+      const A = loop[tri[0]].p.slice();
+      const B = loop[tri[1]].p.slice();
+      const C = loop[tri[2]].p.slice();
+      const ux = B[0] - A[0], uy = B[1] - A[1], uz = B[2] - A[2];
+      const vx = C[0] - A[0], vy = C[1] - A[1], vz = C[2] - A[2];
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const sign = plane.outward === 'negx' ? -nx : plane.outward === 'posx' ? nx : plane.outward === 'negy' ? -ny : ny;
+      if (sign < 0) out.push(...A, ...C, ...B);
+      else out.push(...A, ...B, ...C);
+      count++;
+    }
+  }
+  return count;
+}
+
+
+function makeModelClipPlanes(t) {
+  return [
+    { name:'xmin', axis:0, coord:-t.dims.widthMm/2, keep:'ge', outward:'negx' },
+    { name:'xmax', axis:0, coord: t.dims.widthMm/2, keep:'le', outward:'posx' },
+    { name:'ymin', axis:1, coord:-t.dims.depthMm/2, keep:'ge', outward:'negy' },
+    { name:'ymax', axis:1, coord: t.dims.depthMm/2, keep:'le', outward:'posy' }
+  ];
+}
+
+function cloneModelClipVertex(v) {
+  return { p:[v.p[0], v.p[1], v.p[2]] };
+}
+
+function lerpModelClipVertex(a, b, t) {
+  return { p:[
+    a.p[0] + (b.p[0]-a.p[0])*t,
+    a.p[1] + (b.p[1]-a.p[1])*t,
+    a.p[2] + (b.p[2]-a.p[2])*t
+  ] };
+}
+
+function modelInsidePlane(v, plane, eps=1e-8) {
+  const q=v.p[plane.axis];
+  return plane.keep==='ge' ? q >= plane.coord-eps : q <= plane.coord+eps;
+}
+
+function clipModelPolygonAgainstPlane(poly, plane, segmentsOut) {
+  if(!poly.length) return poly;
+  const out=[], intersections=[];
+  let prev=poly[poly.length-1], prevIn=modelInsidePlane(prev,plane);
+  for(const curr of poly){
+    const currIn=modelInsidePlane(curr,plane);
+    if(currIn!==prevIn){
+      const denom=curr.p[plane.axis]-prev.p[plane.axis];
+      const tt=Math.abs(denom)<1e-14 ? 0 : (plane.coord-prev.p[plane.axis])/denom;
+      const inter=lerpModelClipVertex(prev,curr,Math.max(0,Math.min(1,tt)));
+      inter.p[plane.axis]=plane.coord;
+      intersections.push(inter);
+      out.push(inter);
+    }
+    if(currIn) out.push(curr);
+    prev=curr; prevIn=currIn;
+  }
+  if(intersections.length===2) segmentsOut.push([intersections[0],intersections[1]]);
+  return out;
+}
+
+function modelPointKey2D(v, plane, scale=100000) {
+  const u=plane.axis===0 ? v.p[1] : v.p[0];
+  return `${Math.round(u*scale)}:${Math.round(v.p[2]*scale)}`;
+}
+
+function normalizeCutSegments(segments, plane) {
+  const unique=new Map();
+  for(const seg of segments){
+    const a=modelPointKey2D(seg[0],plane), b=modelPointKey2D(seg[1],plane);
+    if(a===b) continue;
+    const key=a<b ? `${a}|${b}` : `${b}|${a}`;
+    if(!unique.has(key)) unique.set(key,seg);
+  }
+  return [...unique.values()];
+}
+
+function buildValidatedCutLoops(segments, plane) {
+  const clean=normalizeCutSegments(segments,plane);
+  if(!clean.length) return {ok:true,loops:[],segments:clean};
+  const nodes=new Map(), edges=[];
+  const add=(v)=>{
+    const k=modelPointKey2D(v,plane);
+    if(!nodes.has(k)) nodes.set(k,{pt:v,edges:[]});
+    return k;
+  };
+  for(const seg of clean){
+    const a=add(seg[0]), b=add(seg[1]);
+    if(a===b) continue;
+    const ei=edges.length;
+    edges.push({a,b,used:false});
+    nodes.get(a).edges.push(ei); nodes.get(b).edges.push(ei);
+  }
+  // A watertight manifold cross-section must be a union of closed 2-regular loops.
+  for(const n of nodes.values()) if(n.edges.length!==2) return {ok:false,loops:[],segments:clean};
+  const loops=[];
+  for(let i=0;i<edges.length;i++){
+    if(edges[i].used) continue;
+    const e0=edges[i]; e0.used=true;
+    const start=e0.a; let prev=e0.a, curr=e0.b;
+    const loop=[nodes.get(start).pt,nodes.get(curr).pt];
+    let guard=0;
+    while(curr!==start && guard++<100000){
+      const opts=nodes.get(curr).edges.filter(ei=>!edges[ei].used);
+      if(opts.length!==1) return {ok:false,loops:[],segments:clean};
+      const e=edges[opts[0]]; e.used=true;
+      const next=e.a===curr?e.b:e.a;
+      if(next!==start) loop.push(nodes.get(next).pt);
+      prev=curr; curr=next;
+    }
+    if(curr!==start || loop.length<3) return {ok:false,loops:[],segments:clean};
+    loops.push(loop);
+  }
+  return {ok:true,loops,segments:clean};
+}
+
+
+function buildCutPaths(segments, plane) {
+  const clean=normalizeCutSegments(segments,plane);
+  if(!clean.length) return {ok:true,paths:[],segments:clean};
+  const nodes=new Map(), edges=[];
+  const add=(v)=>{
+    const k=modelPointKey2D(v,plane);
+    if(!nodes.has(k)) nodes.set(k,{pt:v,edges:[]});
+    return k;
+  };
+  for(const seg of clean){
+    const a=add(seg[0]), b=add(seg[1]);
+    if(a===b) continue;
+    const ei=edges.length;
+    edges.push({a,b,used:false});
+    nodes.get(a).edges.push(ei); nodes.get(b).edges.push(ei);
+  }
+  // A sliced shell may legitimately be open at the building foundation. We
+  // accept degree 1 endpoints and degree 2 chain vertices. Branches indicate
+  // ambiguous/non-manifold source geometry and are rejected here.
+  for(const n of nodes.values()) if(n.edges.length<1 || n.edges.length>2) return {ok:false,paths:[],segments:clean};
+
+  const paths=[];
+  const walk=(startKey,startEdge)=>{
+    const path=[nodes.get(startKey).pt];
+    let curr=startKey, edgeIdx=startEdge, guard=0;
+    while(edgeIdx!=null && guard++<100000){
+      const e=edges[edgeIdx];
+      if(e.used) break;
+      e.used=true;
+      const next=e.a===curr?e.b:e.a;
+      path.push(nodes.get(next).pt);
+      curr=next;
+      const opts=nodes.get(curr).edges.filter(ei=>!edges[ei].used);
+      edgeIdx=opts.length?opts[0]:null;
+      if(curr===startKey) break;
+    }
+    return {points:path,closed:curr===startKey};
+  };
+
+  // Open chains first, starting at degree-1 endpoints.
+  for(const [k,n] of nodes){
+    if(n.edges.length!==1) continue;
+    const ei=n.edges.find(e=>!edges[e].used);
+    if(ei!=null) paths.push(walk(k,ei));
+  }
+  // Remaining edges are closed loops.
+  for(let i=0;i<edges.length;i++){
+    if(edges[i].used) continue;
+    paths.push(walk(edges[i].a,i));
+  }
+  if(edges.some(e=>!e.used)) return {ok:false,paths:[],segments:clean};
+  return {ok:true,paths,segments:clean};
+}
+
+function borderTerrainPoint(t, plane, uMm) {
+  const baseMm=Number(els.baseThickness.value);
+  const zExag=Number(els.zExaggeration.value);
+  let x,y,px,py;
+  if(plane.axis===0){
+    x=plane.coord<0 ? t.dims.minX : t.dims.maxX;
+    y=t.dims.minY + (uMm + t.dims.depthMm/2) / t.dims.mmPerMeter;
+    px=plane.coord; py=uMm;
+  } else {
+    y=plane.coord<0 ? t.dims.minY : t.dims.maxY;
+    x=t.dims.minX + (uMm + t.dims.widthMm/2) / t.dims.mmPerMeter;
+    px=uMm; py=plane.coord;
+  }
+  x=Math.max(t.dims.minX,Math.min(t.dims.maxX,x));
+  y=Math.max(t.dims.minY,Math.min(t.dims.maxY,y));
+  const terr=terrainElevationAtXY(t,x,y);
+  const z=baseMm+(terr-t.stats.min)*t.dims.mmPerMeter*zExag;
+  return {p:[px,py,z]};
+}
+
+function planeU(v,plane){ return plane.axis===0 ? v.p[1] : v.p[0]; }
+
+function sampleTerrainClosure(t, plane, uFrom, uTo) {
+  const span=Math.abs(uTo-uFrom);
+  // Sample finely enough to match the visible side-wall profile, without
+  // exploding triangle counts. The terrain mesh spacing is the natural scale.
+  const meshStepMm=Math.max(0.08, Math.min(0.5, t.dims.widthMm / Math.max(2,t.grid.cols-1)));
+  const n=Math.max(1,Math.ceil(span/meshStepMm));
+  const pts=[];
+  for(let i=0;i<=n;i++){
+    const f=i/n;
+    pts.push(borderTerrainPoint(t,plane,uFrom+(uTo-uFrom)*f));
+  }
+  return pts;
+}
+
+function compactCapContour(points, plane) {
+  const out=[];
+  const dist2=(a,b)=>{
+    const au=planeU(a,plane), bu=planeU(b,plane);
+    const dz=a.p[2]-b.p[2], du=au-bu;
+    return du*du+dz*dz;
+  };
+  for(const p of points){
+    if(!out.length || dist2(out[out.length-1],p)>1e-10) out.push(p);
+  }
+  if(out.length>2 && dist2(out[0],out[out.length-1])<1e-10) out.pop();
+  // Remove nearly collinear intermediate points in the 2D cut plane.
+  let changed=true;
+  while(changed && out.length>3){
+    changed=false;
+    for(let i=0;i<out.length;i++){
+      const a=out[(i-1+out.length)%out.length], b=out[i], c=out[(i+1)%out.length];
+      const ax=planeU(b,plane)-planeU(a,plane), ay=b.p[2]-a.p[2];
+      const bx=planeU(c,plane)-planeU(b,plane), by=c.p[2]-b.p[2];
+      const cross=Math.abs(ax*by-ay*bx);
+      const scale=Math.max(1e-9,Math.hypot(ax,ay)*Math.hypot(bx,by));
+      if(cross/scale<1e-7){ out.splice(i,1); changed=true; break; }
+    }
+  }
+  return out;
+}
+
+function appendTerrainClosedCaps(out, paths, plane, t) {
+  let count=0;
+  for(const pathInfo of paths){
+    let chain=pathInfo.points.slice();
+    if(pathInfo.closed && chain.length>1){
+      if(modelPointKey2D(chain[0],plane)===modelPointKey2D(chain[chain.length-1],plane)) chain.pop();
+    }
+    if(chain.length<2) return {ok:false,count};
+    let contour;
+    if(pathInfo.closed){
+      contour=chain;
+    } else {
+      const a=chain[0], b=chain[chain.length-1];
+      const ua=planeU(a,plane), ub=planeU(b,plane);
+      const terrB=borderTerrainPoint(t,plane,ub);
+      const terrA=borderTerrainPoint(t,plane,ua);
+      // Cross-section follows the actual building shell from A→B, then drops
+      // vertically to the terrain and follows the exact relief edge back to A.
+      const ground=sampleTerrainClosure(t,plane,ub,ua);
+      contour=[...chain,terrB,...ground.slice(1,-1),terrA];
+    }
+    contour=compactCapContour(contour,plane);
+    if(contour.length<3) return {ok:false,count};
+    const pts2=contour.map(v=>plane.axis===0 ? new THREE.Vector2(v.p[1],v.p[2]) : new THREE.Vector2(v.p[0],v.p[2]));
+    const tris=THREE.ShapeUtils.triangulateShape(pts2,[]);
+    if(!tris.length) return {ok:false,count};
+    for(const tr of tris){
+      const A=contour[tr[0]].p.slice(),B=contour[tr[1]].p.slice(),C=contour[tr[2]].p.slice();
+      const ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2];
+      const vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
+      const nx=uy*vz-uz*vy, ny=uz*vx-ux*vz;
+      const sign=plane.outward==='negx'?-nx:plane.outward==='posx'?nx:plane.outward==='negy'?-ny:ny;
+      if(sign<0) out.push(...A,...C,...B); else out.push(...A,...B,...C);
+      count++;
+    }
+  }
+  return {ok:true,count};
+}
+
+function appendValidatedCaps(out, loopSets, plane) {
+  let count=0;
+  for(const loop of loopSets){
+    const contour=loop.map(v=>plane.axis===0 ? new THREE.Vector2(v.p[1],v.p[2]) : new THREE.Vector2(v.p[0],v.p[2]));
+    const tris=THREE.ShapeUtils.triangulateShape(contour,[]);
+    if(!tris.length && loop.length>2) return {ok:false,count};
+    for(const tr of tris){
+      const A=loop[tr[0]].p.slice(), B=loop[tr[1]].p.slice(), C=loop[tr[2]].p.slice();
+      const ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2];
+      const vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
+      const nx=uy*vz-uz*vy, ny=uz*vx-ux*vz;
+      const sign=plane.outward==='negx'?-nx:plane.outward==='posx'?nx:plane.outward==='negy'?-ny:ny;
+      if(sign<0) out.push(...A,...C,...B); else out.push(...A,...B,...C);
+      count++;
+    }
+  }
+  return {ok:true,count};
+}
+
+function triangleIndices(idx, ti){
+  return idx ? [idx.getX(ti*3),idx.getX(ti*3+1),idx.getX(ti*3+2)] : [ti*3,ti*3+1,ti*3+2];
+}
+
+
+async function getCsgModule() {
+  if (!CsgModulePromise) {
+    CsgModulePromise = import('https://esm.sh/three-bvh-csg@0.0.18?external=three');
+  }
+  return CsgModulePromise;
+}
+
+async function getBufferUtils() {
+  if (!BufferUtilsPromise) {
+    BufferUtilsPromise = import('three/addons/utils/BufferGeometryUtils.js');
+  }
+  return BufferUtilsPromise;
+}
+
+function geometryTrianglesToArray(geometry) {
+  const out = [];
+  const pos = geometry.getAttribute('position');
+  const idx = geometry.index;
+  if (!pos) return out;
+  const start = Math.max(0, geometry.drawRange?.start || 0);
+  const rawCount = Number.isFinite(geometry.drawRange?.count) ? geometry.drawRange.count : (idx ? idx.count : pos.count);
+  const end = Math.min(idx ? idx.count : pos.count, start + rawCount);
+  const readVertex = (i) => [pos.getX(i), pos.getY(i), pos.getZ(i)];
+  for (let i = start; i + 2 < end; i += 3) {
+    const ia = idx ? idx.getX(i) : i;
+    const ib = idx ? idx.getX(i + 1) : i + 1;
+    const ic = idx ? idx.getX(i + 2) : i + 2;
+    out.push(...readVertex(ia), ...readVertex(ib), ...readVertex(ic));
+  }
+  return out;
+}
+
+async function hardCropBuildingSolid(fullTriangles, t) {
+  // Second-stage boolean crop. This is intentionally used only for border
+  // buildings where the lightweight polygon clip could not produce a validated
+  // closed cap. The input remains the complete watertight building body.
+  const { Brush, Evaluator, INTERSECTION } = await getCsgModule();
+  const { mergeVertices } = await getBufferUtils();
+
+  let geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(fullTriangles, 3));
+  geom = mergeVertices(geom, 1e-5);
+  geom.computeVertexNormals();
+  geom.deleteAttribute('uv');
+  geom.deleteAttribute('uv1');
+  geom.deleteAttribute('color');
+
+  geom.computeBoundingBox();
+  const bb = geom.boundingBox;
+  if (!bb || !Number.isFinite(bb.min.z) || !Number.isFinite(bb.max.z)) throw new Error('ungültige Gebäude-Boundingbox');
+
+  const padZ = Math.max(10, (bb.max.z - bb.min.z) * 0.25 + 2);
+  const boxHeight = (bb.max.z - bb.min.z) + 2 * padZ;
+  const boxCenterZ = (bb.max.z + bb.min.z) / 2;
+
+  const boxGeom = new THREE.BoxGeometry(t.dims.widthMm, t.dims.depthMm, boxHeight);
+  boxGeom.deleteAttribute('uv');
+  boxGeom.computeVertexNormals();
+
+  const a = new Brush(geom);
+  a.updateMatrixWorld(true);
+  const b = new Brush(boxGeom);
+  b.position.set(0, 0, boxCenterZ);
+  b.updateMatrixWorld(true);
+
+  const evaluator = new Evaluator();
+  evaluator.useGroups = false;
+  evaluator.consolidateGroups = true;
+  const result = evaluator.evaluate(a, b, INTERSECTION);
+  result.updateMatrixWorld(true);
+  let resultGeom = result.geometry;
+  if (!resultGeom?.getAttribute('position')) throw new Error('CSG lieferte keine Geometrie');
+
+  // Bake result matrix in case the implementation returns a transformed brush.
+  resultGeom = resultGeom.clone();
+  resultGeom.applyMatrix4(result.matrixWorld);
+  const arr = geometryTrianglesToArray(resultGeom);
+  if (!arr.length) throw new Error('CSG-Schnitt ist leer');
+
+  const bx0 = -t.dims.widthMm / 2, bx1 = t.dims.widthMm / 2;
+  const by0 = -t.dims.depthMm / 2, by1 = t.dims.depthMm / 2;
+  for (let i = 0; i < arr.length; i += 3) {
+    const x = arr[i], y = arr[i + 1];
+    if (x < bx0 - 1e-3 || x > bx1 + 1e-3 || y < by0 - 1e-3 || y > by1 + 1e-3) {
+      throw new Error('CSG-Ergebnis ragt noch über den Reliefrahmen');
+    }
+  }
+  return arr;
+}
+
+
+function repairClosedBuildingSoup(flat, toleranceMm=0.01) {
+  const q=(v)=>Math.round(v/toleranceMm);
+  const vk=(p)=>`${q(p[0])},${q(p[1])},${q(p[2])}`;
+  const ek=(a,b)=>a<b?`${a}|${b}`:`${b}|${a}`;
+  const triKey=(A,B,C)=>[vk(A),vk(B),vk(C)].sort().join('|');
+  const tris=[];
+  const seen=new Set();
+  for(let i=0;i+8<flat.length;i+=9){
+    const A=[flat[i],flat[i+1],flat[i+2]], B=[flat[i+3],flat[i+4],flat[i+5]], C=[flat[i+6],flat[i+7],flat[i+8]];
+    const key=triKey(A,B,C);
+    if(seen.has(key)) continue;
+    seen.add(key); tris.push([A,B,C]);
+  }
+  const buildEdges=()=>{
+    const edges=new Map();
+    for(const tri of tris){
+      for(const [A,B] of [[tri[0],tri[1]],[tri[1],tri[2]],[tri[2],tri[0]]]){
+        const ka=vk(A), kb=vk(B); if(ka===kb) continue;
+        const k=ek(ka,kb);
+        const rec=edges.get(k)||{count:0,a:ka,b:kb,pa:A,pb:B};
+        rec.count++; edges.set(k,rec);
+      }
+    }
+    return edges;
+  };
+  let addedCaps=0;
+  for(let pass=0;pass<2;pass++){
+    const edges=buildEdges();
+    if([...edges.values()].some(e=>e.count>2)) return {ok:false,flat:null,addedCaps,reason:'Kante mit mehr als zwei Flächen'};
+    const boundary=[...edges.values()].filter(e=>e.count===1);
+    if(!boundary.length) break;
+    const coords=new Map(), adj=new Map();
+    const addAdj=(a,b,idx)=>{ if(!adj.has(a)) adj.set(a,[]); adj.get(a).push({other:b,idx}); };
+    boundary.forEach((e,i)=>{coords.set(e.a,e.pa);coords.set(e.b,e.pb);addAdj(e.a,e.b,i);addAdj(e.b,e.a,i);});
+    // A safe cap requires closed, non-branching boundary loops.
+    if([...adj.values()].some(a=>a.length!==2)) return {ok:false,flat:null,addedCaps,reason:'offene/verzweigte Randkontur'};
+    const used=new Set();
+    for(let ei=0;ei<boundary.length;ei++){
+      if(used.has(ei)) continue;
+      const e0=boundary[ei]; used.add(ei);
+      const start=e0.a; let prev=e0.a, curr=e0.b;
+      const keys=[start,curr]; let guard=0;
+      while(curr!==start && guard++<100000){
+        const opts=(adj.get(curr)||[]).filter(o=>!used.has(o.idx) && o.other!==prev);
+        const nxt=opts[0] || (adj.get(curr)||[]).find(o=>!used.has(o.idx));
+        if(!nxt) break;
+        used.add(nxt.idx); prev=curr; curr=nxt.other;
+        if(curr!==start) keys.push(curr);
+      }
+      if(curr!==start || keys.length<3) return {ok:false,flat:null,addedCaps,reason:'Randkontur nicht geschlossen'};
+      const pts=keys.map(k=>coords.get(k));
+      // Newell normal: project the loop onto the plane on which it has the largest area.
+      let nx=0,ny=0,nz=0;
+      for(let i=0;i<pts.length;i++){
+        const a=pts[i], b=pts[(i+1)%pts.length];
+        nx+=(a[1]-b[1])*(a[2]+b[2]);
+        ny+=(a[2]-b[2])*(a[0]+b[0]);
+        nz+=(a[0]-b[0])*(a[1]+b[1]);
+      }
+      const an=[Math.abs(nx),Math.abs(ny),Math.abs(nz)];
+      let drop=an.indexOf(Math.max(...an));
+      if(Math.max(...an)<1e-12){
+        const ranges=[0,1,2].map(ax=>Math.max(...pts.map(p=>p[ax]))-Math.min(...pts.map(p=>p[ax])));
+        drop=ranges.indexOf(Math.min(...ranges));
+      }
+      const p2=pts.map(p=>drop===0?new THREE.Vector2(p[1],p[2]):drop===1?new THREE.Vector2(p[0],p[2]):new THREE.Vector2(p[0],p[1]));
+      const caps=THREE.ShapeUtils.triangulateShape(p2,[]);
+      if(!caps.length) return {ok:false,flat:null,addedCaps,reason:'Randkontur nicht triangulierbar'};
+      for(const tr of caps){
+        const A=pts[tr[0]],B=pts[tr[1]],C=pts[tr[2]];
+        const key=triKey(A,B,C); if(seen.has(key)) continue;
+        seen.add(key); tris.push([A,B,C]); addedCaps++;
+      }
+    }
+  }
+  const edges=buildEdges();
+  const non2=[...edges.values()].filter(e=>e.count!==2).length;
+  if(non2) return {ok:false,flat:null,addedCaps,reason:`${non2} Kanten nicht zweifach belegt`};
+  const out=[]; for(const [A,B,C] of tris) out.push(...A,...B,...C);
+  return {ok:true,flat:out,addedCaps,reason:''};
+}
+
+async function loadBuildingTriangles(t) {
+  const elig = buildingEligibility(t.dims);
+  if (!els.includeBuildings.checked || !elig.ok) return { triangles:null, meta:null };
+  setStatus('Gebäude laden · swissBUILDINGS³D', 96);
+  debug(`Gebäude: ${BUILDINGS_TILESET}`);
+  debug(`Gebäude aktiviert · Massstab ca. 1:${Math.round(elig.scale).toLocaleString('de-CH')} · Fläche ${elig.areaKm2.toFixed(2)} km².`);
+
+  const b = selectedBounds;
+  const center = b.getCenter();
+  const centerEcef = geodeticToEcef(center.lng, center.lat, 0);
+  const up = centerEcef.clone().normalize();
+  const lon = center.lng * Math.PI/180, lat = center.lat * Math.PI/180;
+  const north = new THREE.Vector3(-Math.sin(lat)*Math.cos(lon), -Math.sin(lat)*Math.sin(lon), Math.cos(lat)).normalize();
+  const span = Math.max(t.dims.groundW, t.dims.groundH);
+  const altitude = Math.max(1200, span * 1.25);
+  const tileCam = new THREE.PerspectiveCamera(58, Math.max(.4, t.dims.groundW/t.dims.groundH), 10, Math.max(50000, altitude*5));
+  tileCam.position.copy(centerEcef).addScaledVector(up, altitude);
+  tileCam.up.copy(north);
+  tileCam.lookAt(centerEcef);
+  tileCam.updateProjectionMatrix();
+  tileCam.updateMatrixWorld(true);
+
+  const TilesRenderer = await getTilesRendererClass();
+  const tiles = new TilesRenderer(BUILDINGS_TILESET);
+
+  // swissBUILDINGS³D currently delivers Draco-compressed glTF payloads inside
+  // B3DM tiles. 3d-tiles-renderer delegates embedded glTF/GLB decoding to its
+  // LoadingManager, so install one shared GLTFLoader with a DRACOLoader here.
+  // Without this every tile fails with "No DRACOLoader instance provided".
+  const dracoLoader = new DRACOLoader(tiles.manager);
+  dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/libs/draco/gltf/');
+  dracoLoader.setWorkerLimit(4);
+  const gltfLoader = new GLTFLoader(tiles.manager);
+  gltfLoader.setDRACOLoader(dracoLoader);
+  tiles.manager.addHandler(/\.(gltf|glb)(\?.*)?$/i, gltfLoader);
+  debug('Gebäude-Decoder: Draco aktiviert (three 0.180.0).');
+
+  tiles.setCamera(tileCam);
+  tiles.setResolution(tileCam, 1600, 1600);
+  if ('errorTarget' in tiles) tiles.errorTarget = 2.5;
+  if (tiles.lruCache) {
+    if ('maxSize' in tiles.lruCache) tiles.lruCache.maxSize = Math.max(tiles.lruCache.maxSize || 0, 1200);
+    if ('maxBytesSize' in tiles.lruCache) tiles.lruCache.maxBytesSize = Math.max(tiles.lruCache.maxBytesSize || 0, 700e6);
+  }
+  let loadedEvents=0, lastEvents=-1, stable=0;
+  // Keep references to every model that was successfully loaded. A 3D-Tiles
+  // renderer can mark parent / refined tiles invisible even though their
+  // geometry is valid and already in memory. Visibility is a rendering state,
+  // not a criterion for whether we may use the mesh for STL extraction.
+  const loadedRoots = new Set();
+  const onLoad=(ev)=>{
+    loadedEvents++; stable=0;
+    if (ev?.scene) loadedRoots.add(ev.scene);
+  };
+  tiles.addEventListener?.('load-model', onLoad);
+  tiles.addEventListener?.('load-error', (ev) => {
+    debug(`Gebäude-Tile Fehler: ${ev?.url || ''} ${ev?.error?.message || ev?.error || ''}`);
+  });
+  const tmpScene = new THREE.Scene();
+  tmpScene.add(tiles.group);
+  for (let i=0; i<180; i++) {
+    tileCam.updateMatrixWorld(true);
+    tiles.group.updateMatrixWorld(true);
+    tiles.update();
+    await sleep(80);
+    if (loadedEvents === lastEvents) stable++; else stable=0;
+    lastEvents=loadedEvents;
+    if (i > 25 && stable > 18) break;
+  }
+  tiles.group.updateMatrixWorld(true);
+
+  // Add models still managed by the renderer as well. Do NOT filter by
+  // root.visible / mesh.visible: refinement and frustum selection routinely
+  // make loaded tiles invisible, which caused v0.6.3 to report zero meshes.
+  tiles.forEachLoadedModel?.((root) => { if (root) loadedRoots.add(root); });
+  const meshes=[];
+  const seenMeshes = new Set();
+  for (const root of loadedRoots) {
+    root.updateMatrixWorld(true);
+    root.traverse(o => {
+      if (o.isMesh && o.geometry?.attributes?.position && !seenMeshes.has(o)) {
+        seenMeshes.add(o);
+        meshes.push(o);
+      }
+    });
+  }
+  debug(`swissBUILDINGS³D: ${meshes.length} auswertbare Meshes aus ${loadedRoots.size} geladenen Tile-Szenen (${loadedEvents} Tile-Ladevorgänge).`);
+  if (!meshes.length) {
+    dracoLoader.dispose?.();
+    tiles.dispose?.();
+    throw new Error(`Gebäude waren aktiviert, aber swissBUILDINGS³D lieferte keine auswertbaren Meshes (Tile-Ladevorgänge: ${loadedEvents}).`);
+  }
+
+  // Estimate the local ellipsoid→terrain vertical offset from low building vertices.
+  const diffs=[];
+  const wp=new THREE.Vector3();
+  for (const mesh of meshes) {
+    const pos=mesh.geometry.attributes.position;
+    const stride=Math.max(1,Math.floor(pos.count/1200));
+    for(let i=0;i<pos.count;i+=stride){
+      wp.fromBufferAttribute(pos,i).applyMatrix4(mesh.matrixWorld);
+      const [lo,la,h]=ecefToGeodetic(wp.x,wp.y,wp.z);
+      const [x,y]=lv95FromLonLat(lo,la);
+      if(x<t.dims.minX||x>t.dims.maxX||y<t.dims.minY||y>t.dims.maxY) continue;
+      diffs.push(h-terrainElevationAtXY(t,x,y));
+      if(diffs.length>80000) break;
+    }
+    if(diffs.length>80000) break;
+  }
+  if (!diffs.length) {
+    dracoLoader.dispose?.();
+    tiles.dispose?.();
+    throw new Error('Gebäudedaten liegen ausserhalb des gewählten Reliefausschnitts.');
+  }
+  const geoidOffset=percentile(diffs,0.03);
+  const heightFactor=1;
+  debug(`Gebäude-Höhenabgleich: lokaler Offset ≈ ${geoidOffset.toFixed(2)} m · Gebäudehöhe 1.00× (keine Relief-Überhöhung).`);
+
+  const out=[];
+  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0, borderFallbackFull=0, borderHardCropped=0, borderHardCropFailed=0, buildingClosureCaps=0, nonManifoldBuildingsDiscarded=0;
+  const va=new THREE.Vector3(), vb=new THREE.Vector3(), vc=new THREE.Vector3();
+  const modelClipPlanes = makeModelClipPlanes(t);
+  const baseMm=Number(els.baseThickness.value);
+  const zExag=Number(els.zExaggeration.value);
+  const embedMm=0.18;
+  const typicalHeightMm=BUILDING_TYPICAL_HEIGHT_M*t.dims.mmPerMeter;
+  // A true foundation vertex should lie close to the terrain. Eaves and gable
+  // shoulders are substantially higher and must never be pulled down. The
+  // tolerance scales with print scale so steep-slope downhill foundations are
+  // still caught without mistaking roof/eave vertices for the building base.
+  const foundationBandMm=Math.max(0.35, Math.min(2.2, typicalHeightMm*0.45));
+
+  const toModelBase=(v)=>{
+    const [lo,la,h]=ecefToGeodetic(v.x,v.y,v.z);
+    const [x,y]=lv95FromLonLat(lo,la);
+    const terr=terrainElevationAtXY(t,x,y);
+    const correctedH=h-geoidOffset;
+    const xm=(x-t.dims.minX)*t.dims.mmPerMeter-t.dims.widthMm/2;
+    const ym=(y-t.dims.minY)*t.dims.mmPerMeter-t.dims.depthMm/2;
+    const terrainZ=baseMm+(terr-t.stats.min)*t.dims.mmPerMeter*zExag;
+    // Gebäudehöhe selbst bleibt massstäblich 1:1. Die Relief-Überhöhung wird
+    // später als EIN konstanter Z-Versatz pro zusammenhängendem Gebäudekörper
+    // hinzugefügt. So bleiben Wände und Dächer geometrisch starr.
+    const unexaggeratedZ=baseMm+(correctedH-t.stats.min)*t.dims.mmPerMeter;
+    return {x,y,terr,correctedH,terrainZ,p:[xm,ym,unexaggeratedZ]};
+  };
+
+  for(const mesh of meshes){
+    const pos=mesh.geometry.attributes.position, idx=mesh.geometry.index;
+    // Transform every mesh vertex exactly once. This keeps all triangles that
+    // share a vertex watertight after the foundation correction.
+    const verts=new Array(pos.count);
+    for(let vi=0;vi<pos.count;vi++){
+      va.fromBufferAttribute(pos,vi).applyMatrix4(mesh.matrixWorld);
+      verts[vi]=toModelBase(va);
+    }
+
+    // Zusammenhängende Gebäudekörper bestimmen. Die Randbearbeitung muss pro
+    // Gebäude erfolgen, nicht pro Tile-Mesh: ein swisstopo-Tile enthält viele Häuser.
+    const parent=new Int32Array(pos.count);
+    for(let i=0;i<parent.length;i++) parent[i]=i;
+    const find=(a)=>{ while(parent[a]!==a){ parent[a]=parent[parent[a]]; a=parent[a]; } return a; };
+    const unite=(a,b)=>{ a=find(a); b=find(b); if(a!==b) parent[b]=a; };
+    const ntri=idx ? Math.floor(idx.count/3) : Math.floor(pos.count/3);
+    for(let ti=0;ti<ntri;ti++){
+      const [ia,ib,ic]=triangleIndices(idx,ti);
+      unite(ia,ib); unite(ib,ic);
+    }
+    // WICHTIG: swissBUILDINGS³D / glTF dupliziert Vertices oft an harten
+    // Kanten (Fassade ↔ Dach, Giebel ↔ Dach), AUCH bei indexierten Meshes.
+    // Topologisch sind diese Flächen dann über Indizes nicht verbunden, obwohl
+    // sie geometrisch exakt dieselben Eckpunkte besitzen. Für das saubere
+    // Schneiden eines Randhauses müssen wir deshalb IMMER geometrisch
+    // identische Punkte verschweissen, nicht nur bei nicht-indexierten Meshes.
+    // v8.3.12: Dach-, Fassaden- und Bodenteile aus swissBUILDINGS3D liegen
+    // teilweise nur wenige Tausendstel Millimeter auseinander. 0.01 mm im
+    // fertigen Modell ist drucktechnisch unsichtbar, verbindet aber diese
+    // nominell identischen Gebäudekanten zuverlässig zu einer Topologie.
+    const weld=new Map();
+    let weldedVertices=0;
+    const WELD_SCALE=100; // 0.01 mm
+    for(let vi=0;vi<verts.length;vi++){
+      const v=verts[vi];
+      const k=`${Math.round(v.p[0]*WELD_SCALE)}:${Math.round(v.p[1]*WELD_SCALE)}:${Math.round(v.p[2]*WELD_SCALE)}`;
+      if(weld.has(k)){
+        const other=weld.get(k);
+        if(find(vi)!==find(other)){ unite(vi,other); weldedVertices++; }
+      } else weld.set(k,vi);
+    }
+    if(weldedVertices) debug(`Gebäude-Topologie: ${weldedVertices.toLocaleString('de-CH')} geometrisch identische Vertex-Verbindungen verschweisst.`);
+
+    const compTris=new Map(), compVerts=new Map(), compTerr=new Map();
+    for(let ti=0;ti<ntri;ti++){
+      const inds=triangleIndices(idx,ti); const r=find(inds[0]);
+      if(!compTris.has(r)) compTris.set(r,[]);
+      compTris.get(r).push(inds);
+    }
+    for(let vi=0;vi<verts.length;vi++){
+      const r=find(vi);
+      if(!compVerts.has(r)) compVerts.set(r,[]);
+      compVerts.get(r).push(vi);
+      if(!compTerr.has(r)) compTerr.set(r,[]);
+      compTerr.get(r).push(verts[vi].terr);
+    }
+
+    for(const [r,tris] of compTris){
+      const vis=compVerts.get(r)||[];
+      if(!vis.length) continue;
+      const arr=(compTerr.get(r)||[]).slice().sort((a,b)=>a-b);
+      const qi=Math.min(arr.length-1,Math.max(0,Math.floor(arr.length*0.15)));
+      const refTerr=arr[qi];
+      const exaggerationShift=(refTerr-t.stats.min)*t.dims.mmPerMeter*(zExag-1);
+      for(const vi of vis) verts[vi].p[2]+=exaggerationShift;
+
+      // Nur echte Sockelpunkte dieses Gebäudes bis leicht ins Terrain ziehen.
+      const foundationIdx=new Set();
+      for(const [ia,ib,ic] of tris){
+        const A=verts[ia],B=verts[ib],C=verts[ic];
+        const ax=B.p[0]-A.p[0], ay=B.p[1]-A.p[1], az=B.p[2]-A.p[2];
+        const bx=C.p[0]-A.p[0], by=C.p[1]-A.p[1], bz=C.p[2]-A.p[2];
+        const nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx;
+        const nlen=Math.hypot(nx,ny,nz)||1;
+        if(Math.abs(nz)/nlen>0.45) continue;
+        for(const vi of [ia,ib,ic]){
+          const v=verts[vi], above=v.p[2]-v.terrainZ;
+          if(above>=-0.25 && above<=foundationBandMm) foundationIdx.add(vi);
+        }
+      }
+      for(const vi of foundationIdx){
+        const v=verts[vi], target=v.terrainZ-embedMm;
+        if(v.p[2]>target){v.p[2]=target;foundationVertices++;}
+      }
+
+      // Klassifikation ausschliesslich in den fertigen Modellkoordinaten (mm).
+      let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+      for(const vi of vis){
+        const p=verts[vi].p;
+        minX=Math.min(minX,p[0]);maxX=Math.max(maxX,p[0]);
+        minY=Math.min(minY,p[1]);maxY=Math.max(maxY,p[1]);
+      }
+      const bx0=-t.dims.widthMm/2, bx1=t.dims.widthMm/2, by0=-t.dims.depthMm/2, by1=t.dims.depthMm/2;
+      const eps=1e-5;
+      const disjoint=maxX<bx0-eps || minX>bx1+eps || maxY<by0-eps || minY>by1+eps;
+      if(disjoint) continue;
+      const inside=minX>=bx0-eps && maxX<=bx1+eps && minY>=by0-eps && maxY<=by1+eps;
+
+      // v8.3.14: Gebäude werden ab hier NICHT mehr künstlich geschlossen,
+      // repariert oder als separater STL-Körper ausgegeben. Wir übernehmen die
+      // originale sichtbare swissBUILDINGS3D-Oberfläche. Der finale Export
+      // erzeugt daraus robuste nach unten geschlossene Dachprismen und vereinigt
+      // diese mit dem Relief im Manifold-CAD-Kernel. Dadurch gibt es nur noch
+      // einen Volumenkörper und keine überlappenden Schalen.
+      for(const [ia,ib,ic] of tris){
+        out.push(...verts[ia].p,...verts[ib].p,...verts[ic].p);
+        triCount++;
+      }
+      continue;
+
+      if(inside){
+        const component=[];
+        for(const [ia,ib,ic] of tris) component.push(...verts[ia].p,...verts[ib].p,...verts[ic].p);
+        const repaired=repairClosedBuildingSoup(component,0.01);
+        if(!repaired.ok){
+          nonManifoldBuildingsDiscarded++;
+          debug(`Gebäude verworfen: nicht wasserdicht (${repaired.reason}).`);
+          continue;
+        }
+        out.push(...repaired.flat);
+        triCount+=Math.floor(repaired.flat.length/9);
+        buildingClosureCaps+=repaired.addedCaps;
+        continue;
+      }
+
+      borderBuildingsClipped++;
+      const temp=[];
+      const segs={xmin:[],xmax:[],ymin:[],ymax:[]};
+      let localClipped=0;
+      for(const [ia,ib,ic] of tris){
+        let poly=[cloneModelClipVertex(verts[ia]),cloneModelClipVertex(verts[ib]),cloneModelClipVertex(verts[ic])];
+        for(const plane of modelClipPlanes){
+          poly=clipModelPolygonAgainstPlane(poly,plane,segs[plane.name]);
+          if(poly.length<3) break;
+        }
+        if(poly.length<3){localClipped++;continue;}
+        for(let i=1;i<poly.length-1;i++) temp.push(...poly[0].p,...poly[i].p,...poly[i+1].p);
+      }
+
+      // Die swissBUILDINGS³D-Hülle ist am Gebäudeboden häufig offen. Deshalb
+      // entsteht am Reliefrahmen keine geschlossene Ringkontur, sondern eine
+      // offene Kette zwischen zwei Fundamentpunkten. Diese wird exakt auf der
+      // Relief-Seitenebene bis zur lokalen Terrainkante geschlossen. So bildet
+      // die neue Schnittfassade unten eine einzige Fläche mit dem Reliefrand.
+      let valid=true, localCaps=0;
+      for(const plane of modelClipPlanes){
+        const info=buildCutPaths(segs[plane.name],plane);
+        if(!info.ok){ valid=false; break; }
+        const cap=appendTerrainClosedCaps(temp,info.paths,plane,t);
+        if(!cap.ok){ valid=false; break; }
+        localCaps+=cap.count;
+      }
+
+      // Harte Kontrolle: Kein ausgegebener Randhauspunkt darf ausserhalb liegen.
+      if(valid){
+        for(let i=0;i<temp.length;i+=3){
+          const x=temp[i], y=temp[i+1];
+          if(x<bx0-1e-5||x>bx1+1e-5||y<by0-1e-5||y>by1+1e-5){valid=false;break;}
+        }
+      }
+      if(localCaps===0) valid=false;
+
+      if(!valid || !temp.length){
+        // Kein Vollhaus-Fallback mehr: ein über den Reliefrahmen ragendes Haus
+        // darf niemals ausgegeben werden. Lieber gezielt dieses Randhaus
+        // verwerfen als ein geometrisch falsches, überstehendes Modell erzeugen.
+        borderHardCropFailed++;
+        debug('Randhaus konnte nicht eindeutig geschlossen werden und wurde verworfen (kein Vollhaus-Fallback).');
+        continue;
+      }
+      const repaired=repairClosedBuildingSoup(temp,0.01);
+      if(!repaired.ok){
+        borderHardCropFailed++;
+        nonManifoldBuildingsDiscarded++;
+        debug(`Randhaus verworfen: nach Schnitt nicht wasserdicht (${repaired.reason}).`);
+        continue;
+      }
+      out.push(...repaired.flat);
+      const added=Math.floor(repaired.flat.length/9);
+      triCount+=added;
+      buildingClosureCaps+=repaired.addedCaps;
+      capTriangles+=localCaps;
+      clippedTriangles+=localClipped;
+      borderHardCropped++;
+      if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
+    }
+  }
+  debug(`Gebäude-Fundamentband: ${foundationBandMm.toFixed(2)} mm über lokalem Terrain.`);
+  tiles.dispose?.();
+  if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
+  // v8.3.11: swissBUILDINGS³D can expose the same geometric shell through
+  // overlapping/duplicated tile scene meshes. Never export coincident duplicate
+  // triangles: they create non-manifold buildings although the visible geometry
+  // looks correct. Deduplicate by geometry, independent of winding order.
+  const dedup=[];
+  const seenTriangles=new Set();
+  const qv=(v)=>Math.round(v*100000); // 0.00001 mm: effectively exact for STL output
+  for(let i=0;i<out.length;i+=9){
+    const pts=[
+      `${qv(out[i])},${qv(out[i+1])},${qv(out[i+2])}`,
+      `${qv(out[i+3])},${qv(out[i+4])},${qv(out[i+5])}`,
+      `${qv(out[i+6])},${qv(out[i+7])},${qv(out[i+8])}`
+    ].sort();
+    const key=pts.join('|');
+    if(seenTriangles.has(key)) continue;
+    seenTriangles.add(key);
+    dedup.push(out[i],out[i+1],out[i+2],out[i+3],out[i+4],out[i+5],out[i+6],out[i+7],out[i+8]);
+  }
+  const rawTriCount=Math.floor(out.length/9);
+  const dedupTriCount=Math.floor(dedup.length/9);
+  const duplicateTriangles=rawTriCount-dedupTriCount;
+  if(duplicateTriangles>0) debug(`Gebäude-Duplikate entfernt: ${duplicateTriangles.toLocaleString('de-CH')} exakt deckungsgleiche Dreiecke verworfen (${rawTriCount.toLocaleString('de-CH')} → ${dedupTriCount.toLocaleString('de-CH')}).`);
+  triCount=dedupTriCount;
+  debug(`Gebäude-Oberflächenquelle: ${triCount.toLocaleString('de-CH')} eindeutige swissBUILDINGS3D-Dreiecke. Keine Reparatur-/Verwerfungslogik; Volumenkörper entstehen erst im finalen Manifold-Union-Schritt.`);
+  return { triangles:new Float32Array(dedup), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset, duplicateTrianglesRemoved:duplicateTriangles } };
+}
+
+async function generateTerrain() {
+  if (!rawSelection) return;
+  els.generateBtn.disabled = true;
+  els.downloadBtn.disabled = true;
+  els.debug.textContent = '';
+  els.resultInfo.textContent = '';
+  lastStlBlob = null;
+  try {
+    const d = modelDimensions();
+    if (d.groundW > 80000 || d.groundH > 80000) throw new Error('Version 8 ist auf Ausschnitte bis etwa 80 × 80 km begrenzt. Bitte ein kleineres Gebiet wählen.');
+
+    const grid = outputGrid(d);
+    const sourceSetting = els.sourceResolution.value;
+    const sourceRes = sourceSetting === 'auto' ? chooseAutomaticResolution(d, grid) : Number(sourceSetting);
+    const meshSpacingM = Math.max(d.groundW / Math.max(1, grid.cols - 1), d.groundH / Math.max(1, grid.rows - 1));
+
+    const catalogueBbox = stacBboxForDims(d, 100);
+    debug(`STAC: ${STAC_ITEMS}`);
+    debug(`Karten-BBOX: ${stacBbox(selectedBounds)}`);
+    debug(`Rahmen: ${els.selectionShape.value} · Drehung ${d.angleDeg.toFixed(0)}°${els.fixedScaleEnabled.checked ? ` · fixer Massstab 1:${Math.round(Number(els.mapScale.value)||25000).toLocaleString('de-CH')}` : ''}`);
+    debug(`Abdeckungs-BBOX (aus tatsächlichem LV95-Modell): ${catalogueBbox}`);
+    debug(`Mesh-Bodenabstand: ${meshSpacingM.toFixed(2)} m · gewählte Quelle: ${sourceRes} m${sourceSetting === 'auto' ? ' (automatisch)' : ''}`);
+    const items = await fetchStacItemsForBbox(catalogueBbox);
+    debug(`${items.length} STAC-Items gefunden.`);
+    const plans = makeTilePlans(items, sourceRes);
+    debug(`${plans.length} räumliche 1-km-Kacheln geplant; deterministische Primärquelle je Kachel; kein Jahrgangs-Fallback bei Downloadfehlern.`);
+    if (!plans.length) throw new Error(`Keine swissALTI³D-GeoTIFFs für diesen Ausschnitt gefunden.`);
+    if (plans.length > MAX_TILES) throw new Error(`${plans.length} Kacheln wären nötig. Bitte einen kleineren Ausschnitt wählen.`);
+
+    const loadResult = await loadPlansConcurrent(plans, d, grid, (done, total) => {
+      const pct = 12 + 68 * (done / total);
+      setStatus(`Höhendaten ${done}/${total} · ${TILE_CONCURRENCY} parallele Downloads`, pct);
+    });
+    if (loadResult.fallbackUsed.length) debug(`${loadResult.fallbackUsed.length} Kacheln mit alternativer Primärquelle geladen.`);
+    if (loadResult.failed.length) {
+      debug(`${loadResult.failed.length} Kacheln nach allen Versuchen nicht geladen:`);
+      for (const f of loadResult.failed.slice(0, 30)) debug(`  ${f.plan.key}: ${f.errors.slice(-2).join(' | ')}`);
+      if (loadResult.failed.length > 30) debug(`  … ${loadResult.failed.length - 30} weitere`);
+    }
+
+    setStatus('Rasterabdeckung prüfen', 82);
+    let statsBeforeRecovery = terrainStats(grid);
+    let recovery = { passes: 0, recovered: 0, queried: 0 };
+    if (statsBeforeRecovery.missing > 0) {
+      debug(`Nach Erstladung fehlen ${statsBeforeRecovery.missing.toLocaleString('de-CH')} Punkte. Coverage-Recovery wird gestartet.`);
+      recovery = await recoverMissingCoverage(grid, d, sourceRes, 82);
+      debug(`Coverage-Recovery: ${recovery.recovered.toLocaleString('de-CH')} Punkte nachgeladen.`);
+    }
+
+    // If swissALTI³D has no coverage (typically just across the national border),
+    // fill ONLY missing cells from swissALTIRegio. Existing high-resolution cells
+    // remain untouched.
+    let regioRecovery = { recovered: 0, items: 0, assetsTried: 0 };
+    const afterAlti3d = terrainStats(grid);
+    if (afterAlti3d.missing > 0) {
+      debug(`${afterAlti3d.missing.toLocaleString('de-CH')} Punkte weiterhin ohne swissALTI³D-Abdeckung. swissALTIRegio (10 m) wird als Grenzgebiets-Fallback versucht.`);
+      regioRecovery = await recoverWithSwissAltiRegio(grid, d, 91);
+      debug(`swissALTIRegio: ${regioRecovery.recovered.toLocaleString('de-CH')} Punkte ergänzt (${regioRecovery.items} STAC-Items; XYZ: ${regioRecovery.xyzTried || 0}, COG: ${regioRecovery.cogTried || 0} geprüft).`);
+    }
+
+    // Interpolate only genuinely isolated residual NoData cells after every
+    // possible source has been tried. Never use interpolation to hide a
+    // missing catalogue/download strip.
+    setStatus('Isolierte Restlücken prüfen', 94);
+    let filled = 0;
+    let preFill = terrainStats(grid);
+    if (els.smoothMissing.checked && preFill.missing > 0 && preFill.missing / preFill.total < 0.001) {
+      filled = fillSmallGaps(grid, 20);
+    }
+
+    debug('Kachelregel v8.3.8: keine nachträgliche starre Z-Verschiebung einzelner 1-km-Kacheln.');
+    const stats = terrainStats(grid);
+    const missingPct = stats.missing / stats.total * 100;
+    debug(`Raster: ${grid.cols} × ${grid.rows}; Erstbelegung: ${loadResult.totalWritten}; swissALTI³D-Recovery: ${recovery.recovered}; swissALTIRegio: ${regioRecovery.recovered}; isoliert interpoliert: ${filled}; Restlücken: ${missingPct.toFixed(4)} %`);
+    if (!Number.isFinite(stats.min)) throw new Error('Keine gültigen Höhenwerte geladen.');
+    // Critical invariant: never export a terrain with NaN / missing elevations.
+    // A failed generation is preferable to a rectangular crater in the print.
+    if (stats.missing > 0) {
+      throw new Error(`Relief nicht erzeugt: ${stats.missing.toLocaleString('de-CH')} Höhenpunkte (${missingPct.toFixed(3)} %) fehlen noch. Es wird bewusst KEINE fehlerhafte STL mit Löchern erzeugt. Die Abdeckung wurde automatisch mit swissALTI³D-Fallbacks und swissALTIRegio geprüft. Bitte das technische Log melden; eine defekte STL wird nicht ausgegeben.`);
+    }
+
+    terrain = { grid, dims: d, stats };
+    lastBuildingTriangles = null;
+    lastBuildingMeta = null;
+    if (els.includeBuildings.checked) {
+      const buildings = await loadBuildingTriangles(terrain);
+      lastBuildingTriangles = buildings.triangles;
+      lastBuildingMeta = buildings.meta;
+    }
+    setStatus('3D-Vorschau erzeugen', 98);
+    renderTerrainPreview(terrain, lastBuildingTriangles);
+    await new Promise(r => setTimeout(r, 20));
+
+    setStatus('STL vorbereiten', 99);
+    lastStlBlob = await buildBinaryStl(terrain, lastBuildingTriangles);
+    const stlMb = lastStlBlob.size / 1024 / 1024;
+    const elevRange = stats.max - stats.min;
+    const modelReliefHeight = elevRange * d.mmPerMeter * Number(els.zExaggeration.value);
+    const bInfo = lastBuildingMeta ? ` · Gebäude: ${lastBuildingMeta.triangleCount.toLocaleString('de-CH')} Dreiecke` : '';
+    els.resultInfo.textContent = `Höhen: ${stats.min.toFixed(1)}–${stats.max.toFixed(1)} m · Reliefhöhe: ${modelReliefHeight.toFixed(1)} mm + Basis${bInfo} · STL: ${stlMb.toFixed(1)} MB`;
+    els.downloadBtn.disabled = false;
+    setStatus('Fertig', 100);
+  } catch (err) {
+    console.error(err);
+    setStatus('Fehler', 0);
+    els.statusText.textContent = err.message || String(err);
+    debug(err.stack || String(err));
+  } finally {
+    els.generateBtn.disabled = !rawSelection;
+  }
+}
+
+function zMm(elev, terrainObj) {
+  const base = Number(els.baseThickness.value);
+  const exag = Number(els.zExaggeration.value);
+  return base + (elev - terrainObj.stats.min) * terrainObj.dims.mmPerMeter * exag;
+}
+
+const MODEL_CORNER_RADIUS_MM = 5;
+const MODEL_CORNER_ARC_SEGMENTS = 16;
+
+function roundedRectPolygon(w, h, radius = MODEL_CORNER_RADIUS_MM, arcSegments = MODEL_CORNER_ARC_SEGMENTS) {
+  const hw = w / 2, hh = h / 2;
+  const r = Math.max(0, Math.min(radius, hw, hh));
+  if (r <= 1e-9) return [[-hw,-hh],[hw,-hh],[hw,hh],[-hw,hh]];
+  const out = [];
+  const arcs = [
+    [ hw-r, -hh+r, -Math.PI/2, 0 ],
+    [ hw-r,  hh-r, 0, Math.PI/2 ],
+    [ -hw+r, hh-r, Math.PI/2, Math.PI ],
+    [ -hw+r,-hh+r, Math.PI, 3*Math.PI/2 ]
+  ];
+  for (const [cx,cy,a0,a1] of arcs) {
+    for (let i=0;i<=arcSegments;i++) {
+      const a=a0+(a1-a0)*(i/arcSegments);
+      out.push([cx+Math.cos(a)*r, cy+Math.sin(a)*r]);
+    }
+  }
+  return out;
+}
+
+function pointInsideRoundedRect(x, y, w, h, radius = MODEL_CORNER_RADIUS_MM) {
+  const hw=w/2, hh=h/2, r=Math.max(0,Math.min(radius,hw,hh));
+  const ax=Math.abs(x), ay=Math.abs(y);
+  if (ax > hw + 1e-7 || ay > hh + 1e-7) return false;
+  if (r <= 1e-9 || ax <= hw-r || ay <= hh-r) return true;
+  const dx=ax-(hw-r), dy=ay-(hh-r);
+  return dx*dx+dy*dy <= r*r + 1e-7;
+}
+
+function clipPolyAgainstConvexXY(poly, clip) {
+  let out=poly;
+  const eps=1e-8;
+  for (let i=0;i<clip.length && out.length;i++) {
+    const a=clip[i], b=clip[(i+1)%clip.length];
+    const ex=b[0]-a[0], ey=b[1]-a[1];
+    const inside=p => ex*(p[1]-a[1]) - ey*(p[0]-a[0]) >= -eps;
+    const input=out; out=[];
+    for (let j=0;j<input.length;j++) {
+      const P=input[j], Q=input[(j+1)%input.length];
+      const pin=inside(P), qin=inside(Q);
+      if (pin && qin) out.push(Q);
+      else if (pin !== qin) {
+        const dx=Q[0]-P[0], dy=Q[1]-P[1];
+        const den=ex*dy-ey*dx;
+        if (Math.abs(den)>1e-12) {
+          const t=(ey*(P[0]-a[0]) - ex*(P[1]-a[1]))/den;
+          const u=Math.max(0,Math.min(1,t));
+          const I=[P[0]+dx*u,P[1]+dy*u,P[2]+(Q[2]-P[2])*u];
+          out.push(I);
+        }
+        if (!pin && qin) out.push(Q);
+      }
+    }
+  }
+  return out;
+}
+
+
+function clipBoundarySegmentsForEdge(p, q, clip) {
+  // Return every rounded-rectangle segment on which BOTH endpoints lie.
+  // This is the key to a watertight wall: the wall is generated from the
+  // exact boundary edges produced by clipping the terrain triangles.
+  const hits = [];
+  const eps = 1e-5;
+  const onSegment = (v, a, b) => {
+    const dx=b[0]-a[0], dy=b[1]-a[1];
+    const l2=dx*dx+dy*dy;
+    if (l2 < 1e-16) return false;
+    const cross=Math.abs(dx*(v[1]-a[1]) - dy*(v[0]-a[0]));
+    if (cross > eps*Math.sqrt(l2)) return false;
+    const t=((v[0]-a[0])*dx + (v[1]-a[1])*dy)/l2;
+    return t >= -eps && t <= 1+eps;
+  };
+  for (let i=0;i<clip.length;i++) {
+    const a=clip[i], b=clip[(i+1)%clip.length];
+    if (onSegment(p,a,b) && onSegment(q,a,b)) hits.push(i);
+  }
+  return hits;
+}
+
+function clippedPolyBoundaryEdges(poly, clip) {
+  const edges=[];
+  for (let i=0;i<poly.length;i++) {
+    const a=poly[i], b=poly[(i+1)%poly.length];
+    if (clipBoundarySegmentsForEdge(a,b,clip).length) edges.push([a,b]);
+  }
+  return edges;
+}
+
+function terrainZAtModelXY(t, x, y) {
+  const {cols,rows,values}=t.grid;
+  const w=t.dims.widthMm, h=t.dims.depthMm;
+  const cf=(x/w+0.5)*(cols-1);
+  const rf=(0.5-y/h)*(rows-1);
+  const c0=Math.max(0,Math.min(cols-1,Math.floor(cf)));
+  const r0=Math.max(0,Math.min(rows-1,Math.floor(rf)));
+  const c1=Math.min(cols-1,c0+1), r1=Math.min(rows-1,r0+1);
+  const tx=Math.max(0,Math.min(1,cf-c0)), ty=Math.max(0,Math.min(1,rf-r0));
+  const z00=zMm(values[r0*cols+c0],t), z10=zMm(values[r0*cols+c1],t);
+  const z01=zMm(values[r1*cols+c0],t), z11=zMm(values[r1*cols+c1],t);
+  return (z00*(1-tx)+z10*tx)*(1-ty)+(z01*(1-tx)+z11*tx)*ty;
+}
+
+async function getManifoldModule() {
+  if (!ManifoldModulePromise) {
+    ManifoldModulePromise = (async () => {
+      const mod = await import('https://cdn.jsdelivr.net/npm/manifold-3d@3.5.4/+esm');
+      const Module = mod.default;
+      if (typeof Module !== 'function') throw new Error('Manifold-Modulfactory fehlt');
+      const wasm = await Module({
+        locateFile: (name) => name.endsWith('.wasm')
+          ? 'https://cdn.jsdelivr.net/npm/manifold-3d@3.5.4/manifold.wasm'
+          : name
+      });
+      wasm.setup();
+      return wasm;
+    })();
+  }
+  return ManifoldModulePromise;
+}
+
+function validateIndexedManifold(triVerts) {
+  const edges=new Map();
+  const add=(a,b)=>{
+    const k=a<b?`${a}|${b}`:`${b}|${a}`;
+    edges.set(k,(edges.get(k)||0)+1);
+  };
+  for(let i=0;i+2<triVerts.length;i+=3){
+    const a=triVerts[i],b=triVerts[i+1],c=triVerts[i+2];
+    add(a,b); add(b,c); add(c,a);
+  }
+  let open=0, multi=0;
+  for(const n of edges.values()){
+    if(n===1) open++;
+    else if(n!==2) multi++;
+  }
+  return {ok:open===0&&multi===0,open,multi,edges:edges.size};
+}
+
+function buildTerrainIndexedSolid(t) {
+  const { cols, rows, values } = t.grid;
+  const w=t.dims.widthMm, h=t.dims.depthMm;
+  const clip=roundedRectPolygon(w,h);
+  const verts=[];
+  const tris=[];
+  const gridRef=new Int32Array(cols*rows); gridRef.fill(-1);
+  const boundaryRef=new Map();
+  const boundaryEdges=[];
+
+  const addVertex=(p)=>{
+    const i=verts.length/3;
+    verts.push(p[0],p[1],p[2]);
+    return i;
+  };
+  const gridPoint=(r,c)=>[
+    c/(cols-1)*w-w/2,
+    h/2-r/(rows-1)*h,
+    zMm(values[r*cols+c],t)
+  ];
+  const gridVertex=(r,c)=>{
+    const k=r*cols+c;
+    if(gridRef[k]>=0) return gridRef[k];
+    const id=addVertex(gridPoint(r,c));
+    gridRef[k]=id;
+    return id;
+  };
+  const bkey=(p)=>`${Math.round(p[0]*1e6)},${Math.round(p[1]*1e6)},${Math.round(p[2]*1e6)}`;
+  const boundaryVertex=(p)=>{
+    const k=bkey(p);
+    if(boundaryRef.has(k)) return boundaryRef.get(k);
+    const id=addVertex(p);
+    boundaryRef.set(k,id);
+    return id;
+  };
+  const same=(a,b)=>Math.abs(a[0]-b[0])<1e-8&&Math.abs(a[1]-b[1])<1e-8&&Math.abs(a[2]-b[2])<1e-8;
+  const polyVertex=(p,src)=>{
+    for(const q of src) if(same(p,q.p)) return gridVertex(q.r,q.c);
+    return boundaryVertex(p);
+  };
+
+  for(let r=0;r<rows-1;r++) for(let c=0;c<cols-1;c++){
+    const q00={r,c,p:gridPoint(r,c)}, q10={r,c:c+1,p:gridPoint(r,c+1)};
+    const q01={r:r+1,c,p:gridPoint(r+1,c)}, q11={r:r+1,c:c+1,p:gridPoint(r+1,c+1)};
+    for(const src of [[q00,q01,q10],[q10,q01,q11]]){
+      const pts=src.map(q=>q.p);
+      if(pts.every(p=>pointInsideRoundedRect(p[0],p[1],w,h))){
+        tris.push(gridVertex(src[0].r,src[0].c),gridVertex(src[1].r,src[1].c),gridVertex(src[2].r,src[2].c));
+        for(const [A,B] of clippedPolyBoundaryEdges(pts,clip)){
+          const ia=polyVertex(A,src), ib=polyVertex(B,src);
+          boundaryEdges.push([ia,ib]);
+        }
+        continue;
+      }
+      const poly=clipPolyAgainstConvexXY(pts,clip);
+      if(poly.length<3) continue;
+      const ids=poly.map(p=>polyVertex(p,src));
+      for(let i=1;i<ids.length-1;i++) tris.push(ids[0],ids[i],ids[i+1]);
+      for(const [A,B] of clippedPolyBoundaryEdges(poly,clip)){
+        boundaryEdges.push([polyVertex(A,src),polyVertex(B,src)]);
+      }
+    }
+  }
+
+  // Exakte Terrain-Randkontur aus denselben Kanten bilden, die bereits die
+  // Oberseite begrenzen. Seitenwand UND Boden verwenden anschließend exakt
+  // diese Punkte. Damit existieren am unteren Relief-Rand keine T-Junctions.
+  const edgeSeen=new Set(), edges=[];
+  for(const [a,b] of boundaryEdges){
+    if(a===b) continue;
+    const k=a<b?`${a}|${b}`:`${b}|${a}`;
+    if(edgeSeen.has(k)) continue;
+    edgeSeen.add(k); edges.push([a,b]);
+  }
+  const adj=new Map();
+  const addAdj=(a,b)=>{ if(!adj.has(a)) adj.set(a,[]); adj.get(a).push(b); };
+  for(const [a,b] of edges){ addAdj(a,b); addAdj(b,a); }
+  let start=null;
+  for(const [k,v] of adj){ if(v.length===2){ start=k; break; } }
+  if(start==null) throw new Error('Relief-Randkontur konnte nicht aufgebaut werden.');
+  const loop=[start];
+  let prev=null,curr=start,guard=0;
+  while(guard++<edges.length+10){
+    const ns=adj.get(curr)||[];
+    const next=ns.find(n=>n!==prev);
+    if(next==null) break;
+    if(next===start) break;
+    loop.push(next); prev=curr; curr=next;
+  }
+  if(loop.length<3) throw new Error('Relief-Randkontur ist unvollständig.');
+  let area=0;
+  for(let i=0;i<loop.length;i++){
+    const a=loop[i],b=loop[(i+1)%loop.length];
+    const ax=verts[a*3], ay=verts[a*3+1], bx=verts[b*3], by=verts[b*3+1];
+    area += ax*by-bx*ay;
+  }
+  if(area<0) loop.reverse();
+
+  const bottom=[];
+  for(const ti of loop){
+    bottom.push(addVertex([verts[ti*3],verts[ti*3+1],0]));
+  }
+  for(let i=0;i<loop.length;i++){
+    const j=(i+1)%loop.length;
+    const A=loop[i], B=loop[j], a=bottom[i], b=bottom[j];
+    tris.push(A,a,B, B,a,b);
+  }
+  const center=addVertex([0,0,0]);
+  for(let i=0;i<bottom.length;i++){
+    const j=(i+1)%bottom.length;
+    tris.push(center,bottom[j],bottom[i]);
+  }
+
+  const triArray=new Uint32Array(tris);
+  const check=validateIndexedManifold(triArray);
+  if(!check.ok) throw new Error(`Relief-Grundkörper intern ungültig: ${check.open} offene / ${check.multi} mehrfach belegte Kanten.`);
+  return {vertProperties:new Float32Array(verts),triVerts:triArray,check};
+}
+
+function trianglePrismMesh(A,B,C,baseZ,Mesh){
+  // Top face is always CCW in XY so the prism orientation is deterministic.
+  let a=A.slice(),b=B.slice(),c=C.slice();
+  const area=(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
+  if(area<0){ const q=b;b=c;c=q; }
+  const vp=new Float32Array([
+    ...a,...b,...c,
+    a[0],a[1],baseZ, b[0],b[1],baseZ, c[0],c[1],baseZ
+  ]);
+  const tv=new Uint32Array([
+    0,1,2, 3,5,4,
+    0,3,1, 1,3,4,
+    1,4,2, 2,4,5,
+    2,5,0, 0,5,3
+  ]);
+  return new Mesh({numProp:3,vertProperties:vp,triVerts:tv});
+}
+
+async function makeBuildingManifold(t, buildingTriangles, wasm) {
+  if(!buildingTriangles?.length) return {solid:null,prisms:0,sourceTriangles:0};
+  const {Manifold,Mesh}=wasm;
+  const clip=roundedRectPolygon(t.dims.widthMm,t.dims.depthMm);
+  const solids=[];
+  let prismCount=0, sourceTriangles=0;
+  const baseZ=0;
+  const pushPrism=(A,B,C)=>{
+    const proj=Math.abs((B[0]-A[0])*(C[1]-A[1])-(B[1]-A[1])*(C[0]-A[0]));
+    if(proj<1e-8) return;
+    const cx=(A[0]+B[0]+C[0])/3, cy=(A[1]+B[1]+C[1])/3;
+    const terr=terrainZAtModelXY(t,cx,cy);
+    if(Math.max(A[2],B[2],C[2])<=terr+0.02) return;
+    const mesh=trianglePrismMesh(A,B,C,baseZ,Mesh);
+    solids.push(new Manifold(mesh));
+    prismCount++;
+  };
+  for(let i=0;i+8<buildingTriangles.length;i+=9){
+    const src=[
+      [buildingTriangles[i],buildingTriangles[i+1],buildingTriangles[i+2]],
+      [buildingTriangles[i+3],buildingTriangles[i+4],buildingTriangles[i+5]],
+      [buildingTriangles[i+6],buildingTriangles[i+7],buildingTriangles[i+8]]
+    ];
+    const proj=Math.abs((src[1][0]-src[0][0])*(src[2][1]-src[0][1])-(src[1][1]-src[0][1])*(src[2][0]-src[0][0]));
+    if(proj<1e-8) continue; // reine Fassadenfläche: Wand entsteht aus Dachvolumen automatisch
+    sourceTriangles++;
+    const poly=src.every(p=>pointInsideRoundedRect(p[0],p[1],t.dims.widthMm,t.dims.depthMm)) ? src : clipPolyAgainstConvexXY(src,clip);
+    for(let j=1;j<poly.length-1;j++) pushPrism(poly[0],poly[j],poly[j+1]);
+  }
+  if(!solids.length) return {solid:null,prisms:0,sourceTriangles};
+
+  // CAD-Union in Batches: jede Dachfläche wird als echter geschlossener Prismenkörper
+  // erzeugt. Die Union entfernt alle inneren Flächen und rekonstruiert die Fassaden
+  // ausschließlich als Außenhaut des Volumens.
+  let current=solids;
+  while(current.length>1){
+    const next=[];
+    for(let i=0;i<current.length;i+=128){
+      const batch=current.slice(i,i+128);
+      const united=batch.length===1?batch[0]:Manifold.union(batch);
+      next.push(united);
+      if(batch.length>1) for(const x of batch) x.delete?.();
+    }
+    current=next;
+  }
+  return {solid:current[0],prisms:prismCount,sourceTriangles};
+}
+
+function manifoldMeshToBinaryStl(mesh){
+  const vp=mesh.vertProperties, tv=mesh.triVerts, stride=mesh.numProp||3;
+  const triCount=Math.floor(tv.length/3);
+  const buffer=new ArrayBuffer(84+triCount*50);
+  const view=new DataView(buffer);
+  const header=new TextEncoder().encode('Swiss Relief STL Generator · Manifold unified solid · swisstopo');
+  new Uint8Array(buffer,0,Math.min(80,header.length)).set(header.slice(0,80));
+  view.setUint32(80,triCount,true);
+  let off=84;
+  const P=(idx)=>[vp[idx*stride],vp[idx*stride+1],vp[idx*stride+2]];
+  for(let i=0;i<tv.length;i+=3){
+    const a=P(tv[i]),b=P(tv[i+1]),c=P(tv[i+2]);
+    const ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2];
+    const vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+    let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+    const len=Math.hypot(nx,ny,nz)||1; nx/=len;ny/=len;nz/=len;
+    for(const n of [nx,ny,nz]){view.setFloat32(off,n,true);off+=4;}
+    for(const p of [a,b,c]) for(const n of p){view.setFloat32(off,n,true);off+=4;}
+    view.setUint16(off,0,true);off+=2;
+  }
+  return new Blob([buffer],{type:'model/stl'});
+}
+
+async function buildBinaryStl(t, buildingTriangles = null) {
+  setStatus('Geschlossenen Reliefkörper aufbauen', 99);
+  const terrainMeshData=buildTerrainIndexedSolid(t);
+  debug(`Relief-Topologie vor CAD-Union: manifold · ${terrainMeshData.check.edges.toLocaleString('de-CH')} Kanten, keine T-Junctions am Bodenrand.`);
+
+  const wasm=await getManifoldModule();
+  const {Manifold,Mesh}=wasm;
+  const terrainMesh=new Mesh({numProp:3,vertProperties:terrainMeshData.vertProperties,triVerts:terrainMeshData.triVerts});
+  const terrainSolid=new Manifold(terrainMesh);
+  let finalSolid=terrainSolid;
+  let buildingInfo={solid:null,prisms:0,sourceTriangles:0};
+
+  if(buildingTriangles?.length){
+    setStatus('Gebäude als CAD-Volumen vereinigen', 99);
+    buildingInfo=await makeBuildingManifold(t,buildingTriangles,wasm);
+    if(buildingInfo.solid){
+      finalSolid=terrainSolid.add(buildingInfo.solid);
+      terrainSolid.delete?.();
+      buildingInfo.solid.delete?.();
+    }
+    debug(`Gebäude-CAD: ${buildingInfo.sourceTriangles.toLocaleString('de-CH')} projizierbare Oberflächendreiecke → ${buildingInfo.prisms.toLocaleString('de-CH')} geschlossene Dachprismen → boolesche Union mit dem Relief.`);
+  }
+
+  // Manifold ist jetzt die alleinige Quelle der Exportgeometrie. Es existieren
+  // weder Terrainflächen unter Gebäuden noch separat überlappende Gebäudeschalen.
+  const finalMesh=finalSolid.getMesh();
+  const check=validateIndexedManifold(finalMesh.triVerts);
+  debug(`Finale CAD-Topologie: ${check.ok?'MANIFOLD':'FEHLER'} · offene Kanten ${check.open} · mehrfach belegte Kanten ${check.multi} · ${Math.floor(finalMesh.triVerts.length/3).toLocaleString('de-CH')} Dreiecke.`);
+  const blob=manifoldMeshToBinaryStl(finalMesh);
+  finalSolid.delete?.();
+  return blob;
+}
+
+function fileName() {
+  const d = modelDimensions();
+  return `swiss-relief_${(d.groundW/1000).toFixed(1)}x${(d.groundH/1000).toFixed(1)}km_${Math.round(d.widthMm)}mm.stl`.replace(/\./g,'-').replace('-stl','.stl');
+}
+
+function downloadStl() {
+  if (!lastStlBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(lastStlBlob);
+  a.download = fileName();
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function initPreview() {
+  if (renderer) return;
+  els.preview.querySelector('.preview-placeholder')?.remove();
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(42, 1, 0.1, 5000);
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  els.preview.appendChild(renderer.domElement);
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = .08;
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x667788, 1.7));
+  const light = new THREE.DirectionalLight(0xffffff, 2.2); light.position.set(-2,3,4); scene.add(light);
+  const animate = () => { requestAnimationFrame(animate); controls.update(); renderer.render(scene,camera); };
+  animate();
+  resizePreview();
+}
+
+function clearPreview() {
+  if (terrainGroup && scene) { scene.remove(terrainGroup); terrainGroup = null; }
+  if (!renderer && !els.preview.querySelector('.preview-placeholder')) {
+    const p=document.createElement('div'); p.className='preview-placeholder'; p.textContent='Nach dem Laden erscheint hier das Relief.'; els.preview.appendChild(p);
+  }
+}
+
+function renderTerrainPreview(t, buildingTriangles = null) {
+  initPreview();
+  if (terrainGroup) scene.remove(terrainGroup);
+  terrainGroup = new THREE.Group();
+  const src = t.grid;
+  const maxPreview = 260;
+  const step = Math.max(1, Math.ceil(Math.max(src.cols, src.rows) / maxPreview));
+  const cols = Math.floor((src.cols-1)/step)+1;
+  const rows = Math.floor((src.rows-1)/step)+1;
+  const clip=roundedRectPolygon(t.dims.widthMm,t.dims.depthMm);
+  const verts=[];
+  const p=(r,c)=>{
+    const sr=Math.min(src.rows-1,r*step), sc=Math.min(src.cols-1,c*step);
+    return [
+      sc/(src.cols-1)*t.dims.widthMm-t.dims.widthMm/2,
+      t.dims.depthMm/2-sr/(src.rows-1)*t.dims.depthMm,
+      zMm(src.values[sr*src.cols+sc],t)
+    ];
+  };
+  for(let r=0;r<rows-1;r++) for(let c=0;c<cols-1;c++){
+    const p00=p(r,c),p10=p(r,c+1),p01=p(r+1,c),p11=p(r+1,c+1);
+    for(const srcTri of [[p00,p01,p10],[p10,p01,p11]]){
+      const poly=srcTri.every(q=>pointInsideRoundedRect(q[0],q[1],t.dims.widthMm,t.dims.depthMm)) ? srcTri : clipPolyAgainstConvexXY(srcTri,clip);
+      for(let i=1;i<poly.length-1;i++) verts.push(...poly[0],...poly[i],...poly[i+1]);
+    }
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
+  g.computeVertexNormals();
+  const m=new THREE.MeshStandardMaterial({color:0xc8c2b7,roughness:.88,metalness:0,side:THREE.DoubleSide});
+  terrainGroup.add(new THREE.Mesh(g,m));
+
+  const shape=new THREE.Shape();
+  shape.moveTo(clip[0][0],clip[0][1]);
+  for(let i=1;i<clip.length;i++) shape.lineTo(clip[i][0],clip[i][1]);
+  shape.closePath();
+  const baseT=Number(els.baseThickness.value);
+  const baseGeo=new THREE.ExtrudeGeometry(shape,{depth:baseT,bevelEnabled:false,steps:1});
+  const baseMesh=new THREE.Mesh(baseGeo,new THREE.MeshStandardMaterial({color:0x88837b,roughness:1}));
+  terrainGroup.add(baseMesh);
+
+  if (buildingTriangles && buildingTriangles.length) {
+    const bg = new THREE.BufferGeometry();
+    bg.setAttribute('position', new THREE.BufferAttribute(buildingTriangles, 3));
+    bg.computeVertexNormals();
+    const bm = new THREE.MeshStandardMaterial({color:0xddd8cf,roughness:.82,metalness:0,side:THREE.DoubleSide});
+    terrainGroup.add(new THREE.Mesh(bg,bm));
+  }
+  scene.add(terrainGroup);
+  resetCamera();
+}
+
+function resetCamera() {
+  if (!camera || !terrain) return;
+  const size=Math.max(terrain.dims.widthMm,terrain.dims.depthMm);
+  const relief=(terrain.stats.max-terrain.stats.min)*terrain.dims.mmPerMeter*Number(els.zExaggeration.value)+Number(els.baseThickness.value);
+  camera.position.set(size*.72,-size*.92,Math.max(size*.70,relief*3));
+  controls.target.set(0,0,Math.min(relief/3,size*.15));
+  controls.update();
+}
+
+function resizePreview() {
+  if (!renderer || !camera) return;
+  const w=els.preview.clientWidth,h=els.preview.clientHeight;
+  renderer.setSize(w,h,false); camera.aspect=w/h; camera.updateProjectionMatrix();
+}
+
+updateMetrics();
