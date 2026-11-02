@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '9.0';
+const APP_VERSION = '9.1';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -2017,8 +2017,9 @@ async function loadBuildingTriangles(t) {
     const [x,y]=lv95FromLonLat(lo,la);
     const terr=terrainElevationAtXY(t,x,y);
     const correctedH=h-geoidOffset;
-    const xm=(x-t.dims.minX)*t.dims.mmPerMeter-t.dims.widthMm/2;
-    const ym=(y-t.dims.minY)*t.dims.mmPerMeter-t.dims.depthMm/2;
+    const local=worldToLocalGround(t.dims,x,y);
+    const xm=local.lx*t.dims.mmPerMeter;
+    const ym=local.ly*t.dims.mmPerMeter;
     const terrainZ=baseMm+(terr-t.stats.min)*t.dims.mmPerMeter*zExag;
     // Gebäudehöhe selbst bleibt massstäblich 1:1. Die Relief-Überhöhung wird
     // später als EIN konstanter Z-Versatz pro zusammenhängendem Gebäudekörper
@@ -2505,7 +2506,72 @@ function validateIndexedManifold(triVerts) {
   return {ok:open===0&&multi===0,open,multi,edges:edges.size};
 }
 
-function buildTerrainIndexedSolid(t) {
+
+function rasterizeBuildingHeightfield(t, buildingTriangles) {
+  const {cols,rows,values}=t.grid;
+  const w=t.dims.widthMm,h=t.dims.depthMm;
+  const overlay=new Float32Array(cols*rows);
+  overlay.fill(-Infinity);
+  if(!buildingTriangles?.length) return {overlay,roofTriangles:0,coveredVertices:0};
+  const clip=roundedRectPolygon(w,h);
+  const dx=w/(cols-1), dy=h/(rows-1);
+  let roofTriangles=0, coveredVertices=0;
+  const touched=new Uint8Array(cols*rows);
+  const terrainZAt=(k)=>zMm(values[k],t);
+  const rasterTri=(A,B,C)=>{
+    const ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2];
+    const vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
+    const nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+    const nlen=Math.hypot(nx,ny,nz)||1;
+    // Nur echte Dach-/Deckenflächen. Fassaden/Giebel dürfen niemals als
+    // Volumenkeile in das Relief extrudiert werden.
+    if(Math.abs(nz)/nlen < 0.12) return;
+    const den=(B[1]-C[1])*(A[0]-C[0])+(C[0]-B[0])*(A[1]-C[1]);
+    if(Math.abs(den)<1e-10) return;
+    const minX=Math.max(-w/2,Math.min(A[0],B[0],C[0]));
+    const maxX=Math.min( w/2,Math.max(A[0],B[0],C[0]));
+    const minY=Math.max(-h/2,Math.min(A[1],B[1],C[1]));
+    const maxY=Math.min( h/2,Math.max(A[1],B[1],C[1]));
+    if(minX>maxX||minY>maxY) return;
+    const c0=Math.max(0,Math.floor((minX+w/2)/dx)-1);
+    const c1=Math.min(cols-1,Math.ceil((maxX+w/2)/dx)+1);
+    const r0=Math.max(0,Math.floor((h/2-maxY)/dy)-1);
+    const r1=Math.min(rows-1,Math.ceil((h/2-minY)/dy)+1);
+    let used=false;
+    for(let r=r0;r<=r1;r++){
+      const y=h/2-r*dy;
+      for(let c=c0;c<=c1;c++){
+        const x=-w/2+c*dx;
+        if(!pointInsideRoundedRect(x,y,w,h)) continue;
+        const l1=((B[1]-C[1])*(x-C[0])+(C[0]-B[0])*(y-C[1]))/den;
+        const l2=((C[1]-A[1])*(x-C[0])+(A[0]-C[0])*(y-C[1]))/den;
+        const l3=1-l1-l2;
+        if(l1<-1e-7||l2<-1e-7||l3<-1e-7) continue;
+        const z=l1*A[2]+l2*B[2]+l3*C[2];
+        const k=r*cols+c;
+        // Unterirdische Böden/Decken werden ignoriert. Nur Geometrie oberhalb
+        // der lokalen Geländeoberfläche kann Teil der finalen Höhenhülle sein.
+        if(z<=terrainZAt(k)+0.02) continue;
+        if(z>overlay[k]) overlay[k]=z;
+        if(!touched[k]){touched[k]=1;coveredVertices++;}
+        used=true;
+      }
+    }
+    if(used) roofTriangles++;
+  };
+  for(let i=0;i+8<buildingTriangles.length;i+=9){
+    const src=[
+      [buildingTriangles[i],buildingTriangles[i+1],buildingTriangles[i+2]],
+      [buildingTriangles[i+3],buildingTriangles[i+4],buildingTriangles[i+5]],
+      [buildingTriangles[i+6],buildingTriangles[i+7],buildingTriangles[i+8]]
+    ];
+    const poly=src.every(p=>pointInsideRoundedRect(p[0],p[1],w,h))?src:clipPolyAgainstConvexXY(src,clip);
+    for(let j=1;j<poly.length-1;j++) rasterTri(poly[0],poly[j],poly[j+1]);
+  }
+  return {overlay,roofTriangles,coveredVertices};
+}
+
+function buildTerrainIndexedSolid(t, buildingTriangles = null) {
   const { cols, rows, values } = t.grid;
   const w=t.dims.widthMm, h=t.dims.depthMm;
   const clip=roundedRectPolygon(w,h);
@@ -2513,17 +2579,23 @@ function buildTerrainIndexedSolid(t) {
   const topTris=[];
   const gridRef=new Int32Array(cols*rows); gridRef.fill(-1);
   const boundaryRef=new Map();
+  const buildingHF=rasterizeBuildingHeightfield(t,buildingTriangles);
 
   const addVertex=(p)=>{
     const i=verts.length/3;
     verts.push(p[0],p[1],p[2]);
     return i;
   };
-  const gridPoint=(r,c)=>[
-    c/(cols-1)*w-w/2,
-    h/2-r/(rows-1)*h,
-    zMm(values[r*cols+c],t)
-  ];
+  const gridPoint=(r,c)=>{
+    const k=r*cols+c;
+    const terrainZ=zMm(values[k],t);
+    const roofZ=buildingHF.overlay[k];
+    return [
+      c/(cols-1)*w-w/2,
+      h/2-r/(rows-1)*h,
+      Number.isFinite(roofZ)?Math.max(terrainZ,roofZ):terrainZ
+    ];
+  };
   const gridVertex=(r,c)=>{
     const k=r*cols+c;
     if(gridRef[k]>=0) return gridRef[k];
@@ -2656,7 +2728,7 @@ function buildTerrainIndexedSolid(t) {
   const triArray=new Uint32Array(tris);
   const check=validateIndexedManifold(triArray);
   if(!check.ok) throw new Error(`Relief-Grundkörper intern ungültig: ${check.open} offene / ${check.multi} mehrfach belegte Kanten.`);
-  return {vertProperties:new Float32Array(verts),triVerts:triArray,check,boundaryVertices:loop.length};
+  return {vertProperties:new Float32Array(verts),triVerts:triArray,check,boundaryVertices:loop.length,buildingHF};
 }
 
 function trianglePrismMesh(A,B,C,baseZ,Mesh){
@@ -2749,36 +2821,40 @@ function manifoldMeshToBinaryStl(mesh){
 }
 
 async function buildBinaryStl(t, buildingTriangles = null) {
-  setStatus('Geschlossenen Reliefkörper aufbauen', 99);
-  const terrainMeshData=buildTerrainIndexedSolid(t);
-  debug(`Relief-Topologie vor CAD-Union: MANIFOLD · 0 offene · 0 mehrfach belegte Kanten · ${terrainMeshData.boundaryVertices.toLocaleString('de-CH')} gemeinsame Randvertices für Oberfläche/Seitenwand/Boden.`);
-
-  const wasm=await getManifoldModule();
-  const {Manifold,Mesh}=wasm;
-  const terrainMesh=new Mesh({numProp:3,vertProperties:terrainMeshData.vertProperties,triVerts:terrainMeshData.triVerts});
-  const terrainSolid=new Manifold(terrainMesh);
-  let finalSolid=terrainSolid;
-  let buildingInfo={solid:null,prisms:0,sourceTriangles:0};
-
+  setStatus('Gemeinsame Terrain-/Gebäudeoberfläche aufbauen', 99);
+  // v9.1: Terrain und Gebäude werden als EIN 2.5D-Höhenkörper erzeugt.
+  // Es gibt keine separaten Gebäudeschalen und keine nachträgliche Boolean-Union.
+  // Dadurch kann kein Gebäude ausserhalb des Reliefkörpers liegen und die
+  // Manifold-Eigenschaft folgt direkt aus der gemeinsamen Topologie.
+  const meshData=buildTerrainIndexedSolid(t,buildingTriangles);
+  debug(`Relief-/Gebäude-Topologie: MANIFOLD · 0 offene · 0 mehrfach belegte Kanten · ${meshData.boundaryVertices.toLocaleString('de-CH')} gemeinsame Randvertices.`);
   if(buildingTriangles?.length){
-    setStatus('Gebäude als CAD-Volumen vereinigen', 99);
-    buildingInfo=await makeBuildingManifold(t,buildingTriangles,wasm);
-    if(buildingInfo.solid){
-      finalSolid=terrainSolid.add(buildingInfo.solid);
-      terrainSolid.delete?.();
-      buildingInfo.solid.delete?.();
-    }
-    debug(`Gebäude-CAD: ${buildingInfo.sourceTriangles.toLocaleString('de-CH')} projizierbare Oberflächendreiecke → ${buildingInfo.prisms.toLocaleString('de-CH')} geschlossene Dachprismen → boolesche Union mit dem Relief.`);
+    debug(`Gebäude-Höhenhülle: ${meshData.buildingHF.roofTriangles.toLocaleString('de-CH')} Dachflächen rasterisiert · ${meshData.buildingHF.coveredVertices.toLocaleString('de-CH')} Terrainvertices durch Gebäudehöhen ersetzt. Keine separaten Gebäudekörper.`);
   }
+  return indexedMeshToBinaryStl(meshData);
+}
 
-  // Manifold ist jetzt die alleinige Quelle der Exportgeometrie. Es existieren
-  // weder Terrainflächen unter Gebäuden noch separat überlappende Gebäudeschalen.
-  const finalMesh=finalSolid.getMesh();
-  const check=validateIndexedManifold(finalMesh.triVerts);
-  debug(`Finale CAD-Topologie: ${check.ok?'MANIFOLD':'FEHLER'} · offene Kanten ${check.open} · mehrfach belegte Kanten ${check.multi} · ${Math.floor(finalMesh.triVerts.length/3).toLocaleString('de-CH')} Dreiecke.`);
-  const blob=manifoldMeshToBinaryStl(finalMesh);
-  finalSolid.delete?.();
-  return blob;
+function indexedMeshToBinaryStl(mesh){
+  const vp=mesh.vertProperties, tv=mesh.triVerts, stride=3;
+  const triCount=Math.floor(tv.length/3);
+  const buffer=new ArrayBuffer(84+triCount*50);
+  const view=new DataView(buffer);
+  const header=new TextEncoder().encode('Swiss Relief STL Generator v9.1 · unified heightfield · swisstopo');
+  new Uint8Array(buffer,0,Math.min(80,header.length)).set(header.slice(0,80));
+  view.setUint32(80,triCount,true);
+  let off=84;
+  const P=(idx)=>[vp[idx*stride],vp[idx*stride+1],vp[idx*stride+2]];
+  for(let i=0;i<tv.length;i+=3){
+    const a=P(tv[i]),b=P(tv[i+1]),c=P(tv[i+2]);
+    const ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2];
+    const vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+    let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+    const len=Math.hypot(nx,ny,nz)||1; nx/=len;ny/=len;nz/=len;
+    for(const n of [nx,ny,nz]){view.setFloat32(off,n,true);off+=4;}
+    for(const p of [a,b,c]) for(const n of p){view.setFloat32(off,n,true);off+=4;}
+    view.setUint16(off,0,true);off+=2;
+  }
+  return new Blob([buffer],{type:'model/stl'});
 }
 
 function fileName() {

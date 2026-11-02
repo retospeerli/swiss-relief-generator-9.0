@@ -1,3 +1,10 @@
+## v9.1
+
+- Gebäude und Terrain werden als ein gemeinsames 2.5D-Höhenfeld trianguliert.
+- Keine separaten Gebäudeschalen oder Dachprismen mehr.
+- Gebäudeflächen können den Relief-Footprint nicht verlassen.
+- Finale STL-Topologie entsteht aus genau einem geschlossenen Körper.
+
 ## v9.0
 
 - Neue Versionsreihe 9.
