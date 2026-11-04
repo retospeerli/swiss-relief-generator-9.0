@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '9.1';
+const APP_VERSION = '9.2';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -2507,13 +2507,58 @@ function validateIndexedManifold(triVerts) {
 }
 
 
+
+function prepareClippedRoofTriangles(t, buildingTriangles) {
+  const w=t.dims.widthMm,h=t.dims.depthMm;
+  const clip=roundedRectPolygon(w,h);
+  const roofs=[];
+  if(!buildingTriangles?.length) return roofs;
+  const accept=(A,B,C)=>{
+    const ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2];
+    const vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
+    const nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+    const nlen=Math.hypot(nx,ny,nz)||1;
+    if(Math.abs(nz)/nlen < 0.12) return;
+    const den=(B[1]-C[1])*(A[0]-C[0])+(C[0]-B[0])*(A[1]-C[1]);
+    if(Math.abs(den)<1e-10) return;
+    roofs.push({A,B,C,den,
+      minX:Math.min(A[0],B[0],C[0]),maxX:Math.max(A[0],B[0],C[0]),
+      minY:Math.min(A[1],B[1],C[1]),maxY:Math.max(A[1],B[1],C[1])});
+  };
+  for(let i=0;i+8<buildingTriangles.length;i+=9){
+    const src=[
+      [buildingTriangles[i],buildingTriangles[i+1],buildingTriangles[i+2]],
+      [buildingTriangles[i+3],buildingTriangles[i+4],buildingTriangles[i+5]],
+      [buildingTriangles[i+6],buildingTriangles[i+7],buildingTriangles[i+8]]
+    ];
+    const poly=src.every(q=>pointInsideRoundedRect(q[0],q[1],w,h)) ? src : clipPolyAgainstConvexXY(src,clip);
+    for(let j=1;j<poly.length-1;j++) accept(poly[0],poly[j],poly[j+1]);
+  }
+  return roofs;
+}
+
+function roofHeightAtXY(roofTriangles,x,y,terrainZ=-Infinity){
+  let best=-Infinity;
+  for(const R of roofTriangles){
+    if(x<R.minX-1e-7||x>R.maxX+1e-7||y<R.minY-1e-7||y>R.maxY+1e-7) continue;
+    const {A,B,C,den}=R;
+    const l1=((B[1]-C[1])*(x-C[0])+(C[0]-B[0])*(y-C[1]))/den;
+    const l2=((C[1]-A[1])*(x-C[0])+(A[0]-C[0])*(y-C[1]))/den;
+    const l3=1-l1-l2;
+    if(l1<-1e-7||l2<-1e-7||l3<-1e-7) continue;
+    const z=l1*A[2]+l2*B[2]+l3*C[2];
+    if(z>terrainZ+0.02 && z>best) best=z;
+  }
+  return best;
+}
+
 function rasterizeBuildingHeightfield(t, buildingTriangles) {
   const {cols,rows,values}=t.grid;
   const w=t.dims.widthMm,h=t.dims.depthMm;
   const overlay=new Float32Array(cols*rows);
   overlay.fill(-Infinity);
   if(!buildingTriangles?.length) return {overlay,roofTriangles:0,coveredVertices:0};
-  const clip=roundedRectPolygon(w,h);
+  const roofPrimitives=prepareClippedRoofTriangles(t,buildingTriangles);
   const dx=w/(cols-1), dy=h/(rows-1);
   let roofTriangles=0, coveredVertices=0;
   const touched=new Uint8Array(cols*rows);
@@ -2559,16 +2604,8 @@ function rasterizeBuildingHeightfield(t, buildingTriangles) {
     }
     if(used) roofTriangles++;
   };
-  for(let i=0;i+8<buildingTriangles.length;i+=9){
-    const src=[
-      [buildingTriangles[i],buildingTriangles[i+1],buildingTriangles[i+2]],
-      [buildingTriangles[i+3],buildingTriangles[i+4],buildingTriangles[i+5]],
-      [buildingTriangles[i+6],buildingTriangles[i+7],buildingTriangles[i+8]]
-    ];
-    const poly=src.every(p=>pointInsideRoundedRect(p[0],p[1],w,h))?src:clipPolyAgainstConvexXY(src,clip);
-    for(let j=1;j<poly.length-1;j++) rasterTri(poly[0],poly[j],poly[j+1]);
-  }
-  return {overlay,roofTriangles,coveredVertices};
+  for(const R of roofPrimitives) rasterTri(R.A,R.B,R.C);
+  return {overlay,roofTriangles,coveredVertices,roofPrimitives};
 }
 
 function buildTerrainIndexedSolid(t, buildingTriangles = null) {
@@ -2613,7 +2650,15 @@ function buildTerrainIndexedSolid(t, buildingTriangles = null) {
   const boundaryVertex=(p)=>{
     const k=boundaryKey(p);
     if(boundaryRef.has(k)) return boundaryRef.get(k);
-    const id=addVertex(p);
+    // v9.2: Ein Schnittvertex am finalen Relief-Footprint darf seine Höhe
+    // niemals nur aus einem bereits gerasterten Nachbarfeld interpolieren.
+    // Terrain und die tatsächlich geclippte Dachgeometrie werden an exakt
+    // dieser XY-Position erneut abgefragt. So endet ein angeschnittenes Haus
+    // exakt an der Reliefkante und kann dort nicht "durchgezogen" werden.
+    const terrainZ=terrainZAtModelXY(t,p[0],p[1]);
+    const roofZ=roofHeightAtXY(buildingHF.roofPrimitives||[],p[0],p[1],terrainZ);
+    const exact=[p[0],p[1],Number.isFinite(roofZ)?Math.max(terrainZ,roofZ):terrainZ];
+    const id=addVertex(exact);
     boundaryRef.set(k,id);
     return id;
   };
@@ -2829,7 +2874,7 @@ async function buildBinaryStl(t, buildingTriangles = null) {
   const meshData=buildTerrainIndexedSolid(t,buildingTriangles);
   debug(`Relief-/Gebäude-Topologie: MANIFOLD · 0 offene · 0 mehrfach belegte Kanten · ${meshData.boundaryVertices.toLocaleString('de-CH')} gemeinsame Randvertices.`);
   if(buildingTriangles?.length){
-    debug(`Gebäude-Höhenhülle: ${meshData.buildingHF.roofTriangles.toLocaleString('de-CH')} Dachflächen rasterisiert · ${meshData.buildingHF.coveredVertices.toLocaleString('de-CH')} Terrainvertices durch Gebäudehöhen ersetzt. Keine separaten Gebäudekörper.`);
+    debug(`Gebäude-Höhenhülle (exakt am Footprint geclippt): ${meshData.buildingHF.roofTriangles.toLocaleString('de-CH')} Dachflächen rasterisiert · ${meshData.buildingHF.coveredVertices.toLocaleString('de-CH')} Terrainvertices durch Gebäudehöhen ersetzt. Keine separaten Gebäudekörper.`);
   }
   return indexedMeshToBinaryStl(meshData);
 }
@@ -2839,7 +2884,7 @@ function indexedMeshToBinaryStl(mesh){
   const triCount=Math.floor(tv.length/3);
   const buffer=new ArrayBuffer(84+triCount*50);
   const view=new DataView(buffer);
-  const header=new TextEncoder().encode('Swiss Relief STL Generator v9.1 · unified heightfield · swisstopo');
+  const header=new TextEncoder().encode('Swiss Relief STL Generator v9.2 · exact footprint roof clipping · swisstopo');
   new Uint8Array(buffer,0,Math.min(80,header.length)).set(header.slice(0,80));
   view.setUint32(80,triCount,true);
   let off=84;

@@ -1,4 +1,4 @@
-## v9.1
+## v9.2
 
 - Gebäude und Terrain werden als ein gemeinsames 2.5D-Höhenfeld trianguliert.
 - Keine separaten Gebäudeschalen oder Dachprismen mehr.
