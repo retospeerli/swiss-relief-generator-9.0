@@ -1,26 +1,4 @@
-## v9.2
-
-- Gebäude und Terrain werden als ein gemeinsames 2.5D-Höhenfeld trianguliert.
-- Keine separaten Gebäudeschalen oder Dachprismen mehr.
-- Gebäudeflächen können den Relief-Footprint nicht verlassen.
-- Finale STL-Topologie entsteht aus genau einem geschlossenen Körper.
-
-## v9.0
-
-- Neue Versionsreihe 9.
-- Relief-Grundkörper topologisch neu aufgebaut: Die Randkontur wird ausschließlich aus den tatsächlichen Randkanten der fertig triangulierten Geländeoberfläche abgeleitet.
-- Schnittvertices am 5-mm-Eckenradius werden global über XY verschweisst; benachbarte Geländedreiecke können dadurch keine getrennten Randvertices mehr erzeugen.
-- Oberfläche, Seitenwand und Boden verwenden exakt dieselben Randvertices. Der Grundkörper muss intern 0 offene und 0 mehrfach belegte Kanten besitzen.
-- Exportarchitektur: Relief und Gebäude werden vor dem STL-Export als Volumenkörper vereinigt; finale Ausgabe über `manifold-3d` 3.5.4.
-- Keine nachträgliche Kanten-Reparatur des Reliefgrundkörpers.
-
-## v8.3.13
-
-- Gebäude werden komponentenweise topologisch geschlossen und validiert.
-- Offene Randkonturen werden trianguliert; nicht reparierbare Gebäudekörper werden verworfen.
-- Vor STL-Ausgabe muss das gesamte Gebäudemesh manifold sein (jede Kante exakt zwei Flächen).
-
-## v8.3.12
+## v9.3
 
 - Gebäude-Topologie: Verschweisstoleranz auf 0.01 mm erhöht, damit Dach-, Fassaden- und Bodenteile zuverlässig zu geschlossenen Körpern verbunden werden.
 - Keine Änderung an Gebäudehöhen, Terrain oder Ruinenlogik.

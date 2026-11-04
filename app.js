@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '9.2';
+const APP_VERSION = '9.3';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -47,11 +47,11 @@ let terrain = null;
 let lastStlBlob = null;
 let renderer, scene, camera, controls, terrainGroup;
 let lastBuildingTriangles = null;
+let ManifoldModulePromise = null;
 let lastBuildingMeta = null;
 let TilesRendererClass = null;
 let CsgModulePromise = null;
 let BufferUtilsPromise = null;
-let ManifoldModulePromise = null;
 let centerHandle = null;
 let rotateHandle = null;
 let rotateGuide = null;
@@ -467,7 +467,7 @@ function updateMetrics() {
 function buildingEligibility(d = null) {
   if (!rawSelection) return { ok:false, reason:'Zuerst ein Gebiet wählen.' };
   d = d || modelDimensions();
-  if (Math.abs(d.angleDeg || 0) > 1e-6) return { ok:false, reason:'Gebäude sind in v9.0 vorerst nur bei Nordausrichtung (0°) freigeschaltet, damit der stabile v0.6.17-Gebäudecode unverändert bleibt.' };
+  if (Math.abs(d.angleDeg || 0) > 1e-6) return { ok:false, reason:'Gebäude sind in v8.3.10 nur bei Nordausrichtung (0°) freigeschaltet, damit der stabile v0.6.17-Gebäudecode unverändert bleibt.' };
   const scale = d.groundW * 1000 / d.widthMm;
   const areaKm2 = d.groundW * d.groundH / 1e6;
   const typicalWidthMm = BUILDING_TYPICAL_WIDTH_M * d.mmPerMeter;
@@ -693,7 +693,19 @@ async function sampleTile(url, d, grid, resolution = 2, options = {}) {
         if (attempt + 1 < REQUEST_RETRIES) await sleep(RETRY_BASE_MS * (2 ** attempt));
       }
     }
-    if (!tiff) throw lastErr || new Error('GeoTIFF konnte nicht geöffnet werden');
+    if (!tiff) {
+      // v9.3: Ein gescheiterter HTTP-Range-Zugriff bedeutet NICHT, dass die
+      // hochaufgelöste Kachel fehlt. Dieselbe 0.5-m-GeoTIFF-Datei wird als
+      // vollständige Datei geladen, bevor irgendein Datenfallback erlaubt ist.
+      try {
+        const response = await fetchWithRetry(url, { cache:'no-cache' }, Math.max(REQUEST_RETRIES,4));
+        const buffer = await response.arrayBuffer();
+        tiff = await GeoTIFF.fromArrayBuffer(buffer);
+        debug('0.5-m-Kachel: Range-Zugriff fehlgeschlagen, Voll-Download derselben GeoTIFF-Datei erfolgreich.');
+      } catch(fullErr) {
+        throw fullErr || lastErr || new Error('GeoTIFF konnte weder per Range noch vollständig geladen werden');
+      }
+    }
   }
 
   try {
@@ -1797,89 +1809,6 @@ async function hardCropBuildingSolid(fullTriangles, t) {
   return arr;
 }
 
-
-function repairClosedBuildingSoup(flat, toleranceMm=0.01) {
-  const q=(v)=>Math.round(v/toleranceMm);
-  const vk=(p)=>`${q(p[0])},${q(p[1])},${q(p[2])}`;
-  const ek=(a,b)=>a<b?`${a}|${b}`:`${b}|${a}`;
-  const triKey=(A,B,C)=>[vk(A),vk(B),vk(C)].sort().join('|');
-  const tris=[];
-  const seen=new Set();
-  for(let i=0;i+8<flat.length;i+=9){
-    const A=[flat[i],flat[i+1],flat[i+2]], B=[flat[i+3],flat[i+4],flat[i+5]], C=[flat[i+6],flat[i+7],flat[i+8]];
-    const key=triKey(A,B,C);
-    if(seen.has(key)) continue;
-    seen.add(key); tris.push([A,B,C]);
-  }
-  const buildEdges=()=>{
-    const edges=new Map();
-    for(const tri of tris){
-      for(const [A,B] of [[tri[0],tri[1]],[tri[1],tri[2]],[tri[2],tri[0]]]){
-        const ka=vk(A), kb=vk(B); if(ka===kb) continue;
-        const k=ek(ka,kb);
-        const rec=edges.get(k)||{count:0,a:ka,b:kb,pa:A,pb:B};
-        rec.count++; edges.set(k,rec);
-      }
-    }
-    return edges;
-  };
-  let addedCaps=0;
-  for(let pass=0;pass<2;pass++){
-    const edges=buildEdges();
-    if([...edges.values()].some(e=>e.count>2)) return {ok:false,flat:null,addedCaps,reason:'Kante mit mehr als zwei Flächen'};
-    const boundary=[...edges.values()].filter(e=>e.count===1);
-    if(!boundary.length) break;
-    const coords=new Map(), adj=new Map();
-    const addAdj=(a,b,idx)=>{ if(!adj.has(a)) adj.set(a,[]); adj.get(a).push({other:b,idx}); };
-    boundary.forEach((e,i)=>{coords.set(e.a,e.pa);coords.set(e.b,e.pb);addAdj(e.a,e.b,i);addAdj(e.b,e.a,i);});
-    // A safe cap requires closed, non-branching boundary loops.
-    if([...adj.values()].some(a=>a.length!==2)) return {ok:false,flat:null,addedCaps,reason:'offene/verzweigte Randkontur'};
-    const used=new Set();
-    for(let ei=0;ei<boundary.length;ei++){
-      if(used.has(ei)) continue;
-      const e0=boundary[ei]; used.add(ei);
-      const start=e0.a; let prev=e0.a, curr=e0.b;
-      const keys=[start,curr]; let guard=0;
-      while(curr!==start && guard++<100000){
-        const opts=(adj.get(curr)||[]).filter(o=>!used.has(o.idx) && o.other!==prev);
-        const nxt=opts[0] || (adj.get(curr)||[]).find(o=>!used.has(o.idx));
-        if(!nxt) break;
-        used.add(nxt.idx); prev=curr; curr=nxt.other;
-        if(curr!==start) keys.push(curr);
-      }
-      if(curr!==start || keys.length<3) return {ok:false,flat:null,addedCaps,reason:'Randkontur nicht geschlossen'};
-      const pts=keys.map(k=>coords.get(k));
-      // Newell normal: project the loop onto the plane on which it has the largest area.
-      let nx=0,ny=0,nz=0;
-      for(let i=0;i<pts.length;i++){
-        const a=pts[i], b=pts[(i+1)%pts.length];
-        nx+=(a[1]-b[1])*(a[2]+b[2]);
-        ny+=(a[2]-b[2])*(a[0]+b[0]);
-        nz+=(a[0]-b[0])*(a[1]+b[1]);
-      }
-      const an=[Math.abs(nx),Math.abs(ny),Math.abs(nz)];
-      let drop=an.indexOf(Math.max(...an));
-      if(Math.max(...an)<1e-12){
-        const ranges=[0,1,2].map(ax=>Math.max(...pts.map(p=>p[ax]))-Math.min(...pts.map(p=>p[ax])));
-        drop=ranges.indexOf(Math.min(...ranges));
-      }
-      const p2=pts.map(p=>drop===0?new THREE.Vector2(p[1],p[2]):drop===1?new THREE.Vector2(p[0],p[2]):new THREE.Vector2(p[0],p[1]));
-      const caps=THREE.ShapeUtils.triangulateShape(p2,[]);
-      if(!caps.length) return {ok:false,flat:null,addedCaps,reason:'Randkontur nicht triangulierbar'};
-      for(const tr of caps){
-        const A=pts[tr[0]],B=pts[tr[1]],C=pts[tr[2]];
-        const key=triKey(A,B,C); if(seen.has(key)) continue;
-        seen.add(key); tris.push([A,B,C]); addedCaps++;
-      }
-    }
-  }
-  const edges=buildEdges();
-  const non2=[...edges.values()].filter(e=>e.count!==2).length;
-  if(non2) return {ok:false,flat:null,addedCaps,reason:`${non2} Kanten nicht zweifach belegt`};
-  const out=[]; for(const [A,B,C] of tris) out.push(...A,...B,...C);
-  return {ok:true,flat:out,addedCaps,reason:''};
-}
-
 async function loadBuildingTriangles(t) {
   const elig = buildingEligibility(t.dims);
   if (!els.includeBuildings.checked || !elig.ok) return { triangles:null, meta:null };
@@ -1999,7 +1928,7 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude-Höhenabgleich: lokaler Offset ≈ ${geoidOffset.toFixed(2)} m · Gebäudehöhe 1.00× (keine Relief-Überhöhung).`);
 
   const out=[];
-  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0, borderFallbackFull=0, borderHardCropped=0, borderHardCropFailed=0, buildingClosureCaps=0, nonManifoldBuildingsDiscarded=0;
+  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0, borderFallbackFull=0, borderHardCropped=0, borderHardCropFailed=0;
   const va=new THREE.Vector3(), vb=new THREE.Vector3(), vc=new THREE.Vector3();
   const modelClipPlanes = makeModelClipPlanes(t);
   const baseMm=Number(els.baseThickness.value);
@@ -2017,9 +1946,8 @@ async function loadBuildingTriangles(t) {
     const [x,y]=lv95FromLonLat(lo,la);
     const terr=terrainElevationAtXY(t,x,y);
     const correctedH=h-geoidOffset;
-    const local=worldToLocalGround(t.dims,x,y);
-    const xm=local.lx*t.dims.mmPerMeter;
-    const ym=local.ly*t.dims.mmPerMeter;
+    const xm=(x-t.dims.minX)*t.dims.mmPerMeter-t.dims.widthMm/2;
+    const ym=(y-t.dims.minY)*t.dims.mmPerMeter-t.dims.depthMm/2;
     const terrainZ=baseMm+(terr-t.stats.min)*t.dims.mmPerMeter*zExag;
     // Gebäudehöhe selbst bleibt massstäblich 1:1. Die Relief-Überhöhung wird
     // später als EIN konstanter Z-Versatz pro zusammenhängendem Gebäudekörper
@@ -2127,30 +2055,8 @@ async function loadBuildingTriangles(t) {
       if(disjoint) continue;
       const inside=minX>=bx0-eps && maxX<=bx1+eps && minY>=by0-eps && maxY<=by1+eps;
 
-      // v9.0: Gebäude werden ab hier NICHT mehr künstlich geschlossen,
-      // repariert oder als separater STL-Körper ausgegeben. Wir übernehmen die
-      // originale sichtbare swissBUILDINGS3D-Oberfläche. Der finale Export
-      // erzeugt daraus robuste nach unten geschlossene Dachprismen und vereinigt
-      // diese mit dem Relief im Manifold-CAD-Kernel. Dadurch gibt es nur noch
-      // einen Volumenkörper und keine überlappenden Schalen.
-      for(const [ia,ib,ic] of tris){
-        out.push(...verts[ia].p,...verts[ib].p,...verts[ic].p);
-        triCount++;
-      }
-      continue;
-
       if(inside){
-        const component=[];
-        for(const [ia,ib,ic] of tris) component.push(...verts[ia].p,...verts[ib].p,...verts[ic].p);
-        const repaired=repairClosedBuildingSoup(component,0.01);
-        if(!repaired.ok){
-          nonManifoldBuildingsDiscarded++;
-          debug(`Gebäude verworfen: nicht wasserdicht (${repaired.reason}).`);
-          continue;
-        }
-        out.push(...repaired.flat);
-        triCount+=Math.floor(repaired.flat.length/9);
-        buildingClosureCaps+=repaired.addedCaps;
+        for(const [ia,ib,ic] of tris){ out.push(...verts[ia].p,...verts[ib].p,...verts[ic].p); triCount++; }
         continue;
       }
 
@@ -2199,17 +2105,9 @@ async function loadBuildingTriangles(t) {
         debug('Randhaus konnte nicht eindeutig geschlossen werden und wurde verworfen (kein Vollhaus-Fallback).');
         continue;
       }
-      const repaired=repairClosedBuildingSoup(temp,0.01);
-      if(!repaired.ok){
-        borderHardCropFailed++;
-        nonManifoldBuildingsDiscarded++;
-        debug(`Randhaus verworfen: nach Schnitt nicht wasserdicht (${repaired.reason}).`);
-        continue;
-      }
-      out.push(...repaired.flat);
-      const added=Math.floor(repaired.flat.length/9);
+      out.push(...temp);
+      const added=Math.floor(temp.length/9);
       triCount+=added;
-      buildingClosureCaps+=repaired.addedCaps;
       capTriangles+=localCaps;
       clippedTriangles+=localClipped;
       borderHardCropped++;
@@ -2242,7 +2140,7 @@ async function loadBuildingTriangles(t) {
   const duplicateTriangles=rawTriCount-dedupTriCount;
   if(duplicateTriangles>0) debug(`Gebäude-Duplikate entfernt: ${duplicateTriangles.toLocaleString('de-CH')} exakt deckungsgleiche Dreiecke verworfen (${rawTriCount.toLocaleString('de-CH')} → ${dedupTriCount.toLocaleString('de-CH')}).`);
   triCount=dedupTriCount;
-  debug(`Gebäude-Oberflächenquelle: ${triCount.toLocaleString('de-CH')} eindeutige swissBUILDINGS3D-Dreiecke. Keine Reparatur-/Verwerfungslogik; Volumenkörper entstehen erst im finalen Manifold-Union-Schritt.`);
+  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} eindeutige Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke im Primärschnitt; Randhäuser exakt gekappt/geschlossen: ${borderHardCropped.toLocaleString('de-CH')}; Randhäuser verworfen statt überstehend ausgegeben: ${borderHardCropFailed.toLocaleString('de-CH')}; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
   return { triangles:new Float32Array(dedup), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset, duplicateTrianglesRemoved:duplicateTriangles } };
 }
 
@@ -2506,109 +2404,7 @@ function validateIndexedManifold(triVerts) {
   return {ok:open===0&&multi===0,open,multi,edges:edges.size};
 }
 
-
-
-function prepareClippedRoofTriangles(t, buildingTriangles) {
-  const w=t.dims.widthMm,h=t.dims.depthMm;
-  const clip=roundedRectPolygon(w,h);
-  const roofs=[];
-  if(!buildingTriangles?.length) return roofs;
-  const accept=(A,B,C)=>{
-    const ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2];
-    const vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
-    const nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
-    const nlen=Math.hypot(nx,ny,nz)||1;
-    if(Math.abs(nz)/nlen < 0.12) return;
-    const den=(B[1]-C[1])*(A[0]-C[0])+(C[0]-B[0])*(A[1]-C[1]);
-    if(Math.abs(den)<1e-10) return;
-    roofs.push({A,B,C,den,
-      minX:Math.min(A[0],B[0],C[0]),maxX:Math.max(A[0],B[0],C[0]),
-      minY:Math.min(A[1],B[1],C[1]),maxY:Math.max(A[1],B[1],C[1])});
-  };
-  for(let i=0;i+8<buildingTriangles.length;i+=9){
-    const src=[
-      [buildingTriangles[i],buildingTriangles[i+1],buildingTriangles[i+2]],
-      [buildingTriangles[i+3],buildingTriangles[i+4],buildingTriangles[i+5]],
-      [buildingTriangles[i+6],buildingTriangles[i+7],buildingTriangles[i+8]]
-    ];
-    const poly=src.every(q=>pointInsideRoundedRect(q[0],q[1],w,h)) ? src : clipPolyAgainstConvexXY(src,clip);
-    for(let j=1;j<poly.length-1;j++) accept(poly[0],poly[j],poly[j+1]);
-  }
-  return roofs;
-}
-
-function roofHeightAtXY(roofTriangles,x,y,terrainZ=-Infinity){
-  let best=-Infinity;
-  for(const R of roofTriangles){
-    if(x<R.minX-1e-7||x>R.maxX+1e-7||y<R.minY-1e-7||y>R.maxY+1e-7) continue;
-    const {A,B,C,den}=R;
-    const l1=((B[1]-C[1])*(x-C[0])+(C[0]-B[0])*(y-C[1]))/den;
-    const l2=((C[1]-A[1])*(x-C[0])+(A[0]-C[0])*(y-C[1]))/den;
-    const l3=1-l1-l2;
-    if(l1<-1e-7||l2<-1e-7||l3<-1e-7) continue;
-    const z=l1*A[2]+l2*B[2]+l3*C[2];
-    if(z>terrainZ+0.02 && z>best) best=z;
-  }
-  return best;
-}
-
-function rasterizeBuildingHeightfield(t, buildingTriangles) {
-  const {cols,rows,values}=t.grid;
-  const w=t.dims.widthMm,h=t.dims.depthMm;
-  const overlay=new Float32Array(cols*rows);
-  overlay.fill(-Infinity);
-  if(!buildingTriangles?.length) return {overlay,roofTriangles:0,coveredVertices:0};
-  const roofPrimitives=prepareClippedRoofTriangles(t,buildingTriangles);
-  const dx=w/(cols-1), dy=h/(rows-1);
-  let roofTriangles=0, coveredVertices=0;
-  const touched=new Uint8Array(cols*rows);
-  const terrainZAt=(k)=>zMm(values[k],t);
-  const rasterTri=(A,B,C)=>{
-    const ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2];
-    const vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
-    const nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
-    const nlen=Math.hypot(nx,ny,nz)||1;
-    // Nur echte Dach-/Deckenflächen. Fassaden/Giebel dürfen niemals als
-    // Volumenkeile in das Relief extrudiert werden.
-    if(Math.abs(nz)/nlen < 0.12) return;
-    const den=(B[1]-C[1])*(A[0]-C[0])+(C[0]-B[0])*(A[1]-C[1]);
-    if(Math.abs(den)<1e-10) return;
-    const minX=Math.max(-w/2,Math.min(A[0],B[0],C[0]));
-    const maxX=Math.min( w/2,Math.max(A[0],B[0],C[0]));
-    const minY=Math.max(-h/2,Math.min(A[1],B[1],C[1]));
-    const maxY=Math.min( h/2,Math.max(A[1],B[1],C[1]));
-    if(minX>maxX||minY>maxY) return;
-    const c0=Math.max(0,Math.floor((minX+w/2)/dx)-1);
-    const c1=Math.min(cols-1,Math.ceil((maxX+w/2)/dx)+1);
-    const r0=Math.max(0,Math.floor((h/2-maxY)/dy)-1);
-    const r1=Math.min(rows-1,Math.ceil((h/2-minY)/dy)+1);
-    let used=false;
-    for(let r=r0;r<=r1;r++){
-      const y=h/2-r*dy;
-      for(let c=c0;c<=c1;c++){
-        const x=-w/2+c*dx;
-        if(!pointInsideRoundedRect(x,y,w,h)) continue;
-        const l1=((B[1]-C[1])*(x-C[0])+(C[0]-B[0])*(y-C[1]))/den;
-        const l2=((C[1]-A[1])*(x-C[0])+(A[0]-C[0])*(y-C[1]))/den;
-        const l3=1-l1-l2;
-        if(l1<-1e-7||l2<-1e-7||l3<-1e-7) continue;
-        const z=l1*A[2]+l2*B[2]+l3*C[2];
-        const k=r*cols+c;
-        // Unterirdische Böden/Decken werden ignoriert. Nur Geometrie oberhalb
-        // der lokalen Geländeoberfläche kann Teil der finalen Höhenhülle sein.
-        if(z<=terrainZAt(k)+0.02) continue;
-        if(z>overlay[k]) overlay[k]=z;
-        if(!touched[k]){touched[k]=1;coveredVertices++;}
-        used=true;
-      }
-    }
-    if(used) roofTriangles++;
-  };
-  for(const R of roofPrimitives) rasterTri(R.A,R.B,R.C);
-  return {overlay,roofTriangles,coveredVertices,roofPrimitives};
-}
-
-function buildTerrainIndexedSolid(t, buildingTriangles = null) {
+function buildTerrainIndexedSolid(t) {
   const { cols, rows, values } = t.grid;
   const w=t.dims.widthMm, h=t.dims.depthMm;
   const clip=roundedRectPolygon(w,h);
@@ -2616,23 +2412,17 @@ function buildTerrainIndexedSolid(t, buildingTriangles = null) {
   const topTris=[];
   const gridRef=new Int32Array(cols*rows); gridRef.fill(-1);
   const boundaryRef=new Map();
-  const buildingHF=rasterizeBuildingHeightfield(t,buildingTriangles);
 
   const addVertex=(p)=>{
     const i=verts.length/3;
     verts.push(p[0],p[1],p[2]);
     return i;
   };
-  const gridPoint=(r,c)=>{
-    const k=r*cols+c;
-    const terrainZ=zMm(values[k],t);
-    const roofZ=buildingHF.overlay[k];
-    return [
-      c/(cols-1)*w-w/2,
-      h/2-r/(rows-1)*h,
-      Number.isFinite(roofZ)?Math.max(terrainZ,roofZ):terrainZ
-    ];
-  };
+  const gridPoint=(r,c)=>[
+    c/(cols-1)*w-w/2,
+    h/2-r/(rows-1)*h,
+    zMm(values[r*cols+c],t)
+  ];
   const gridVertex=(r,c)=>{
     const k=r*cols+c;
     if(gridRef[k]>=0) return gridRef[k];
@@ -2650,15 +2440,7 @@ function buildTerrainIndexedSolid(t, buildingTriangles = null) {
   const boundaryVertex=(p)=>{
     const k=boundaryKey(p);
     if(boundaryRef.has(k)) return boundaryRef.get(k);
-    // v9.2: Ein Schnittvertex am finalen Relief-Footprint darf seine Höhe
-    // niemals nur aus einem bereits gerasterten Nachbarfeld interpolieren.
-    // Terrain und die tatsächlich geclippte Dachgeometrie werden an exakt
-    // dieser XY-Position erneut abgefragt. So endet ein angeschnittenes Haus
-    // exakt an der Reliefkante und kann dort nicht "durchgezogen" werden.
-    const terrainZ=terrainZAtModelXY(t,p[0],p[1]);
-    const roofZ=roofHeightAtXY(buildingHF.roofPrimitives||[],p[0],p[1],terrainZ);
-    const exact=[p[0],p[1],Number.isFinite(roofZ)?Math.max(terrainZ,roofZ):terrainZ];
-    const id=addVertex(exact);
+    const id=addVertex(p);
     boundaryRef.set(k,id);
     return id;
   };
@@ -2773,74 +2555,9 @@ function buildTerrainIndexedSolid(t, buildingTriangles = null) {
   const triArray=new Uint32Array(tris);
   const check=validateIndexedManifold(triArray);
   if(!check.ok) throw new Error(`Relief-Grundkörper intern ungültig: ${check.open} offene / ${check.multi} mehrfach belegte Kanten.`);
-  return {vertProperties:new Float32Array(verts),triVerts:triArray,check,boundaryVertices:loop.length,buildingHF};
+  return {vertProperties:new Float32Array(verts),triVerts:triArray,check,boundaryVertices:loop.length};
 }
 
-function trianglePrismMesh(A,B,C,baseZ,Mesh){
-  // Top face is always CCW in XY so the prism orientation is deterministic.
-  let a=A.slice(),b=B.slice(),c=C.slice();
-  const area=(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
-  if(area<0){ const q=b;b=c;c=q; }
-  const vp=new Float32Array([
-    ...a,...b,...c,
-    a[0],a[1],baseZ, b[0],b[1],baseZ, c[0],c[1],baseZ
-  ]);
-  const tv=new Uint32Array([
-    0,1,2, 3,5,4,
-    0,3,1, 1,3,4,
-    1,4,2, 2,4,5,
-    2,5,0, 0,5,3
-  ]);
-  return new Mesh({numProp:3,vertProperties:vp,triVerts:tv});
-}
-
-async function makeBuildingManifold(t, buildingTriangles, wasm) {
-  if(!buildingTriangles?.length) return {solid:null,prisms:0,sourceTriangles:0};
-  const {Manifold,Mesh}=wasm;
-  const clip=roundedRectPolygon(t.dims.widthMm,t.dims.depthMm);
-  const solids=[];
-  let prismCount=0, sourceTriangles=0;
-  const baseZ=0;
-  const pushPrism=(A,B,C)=>{
-    const proj=Math.abs((B[0]-A[0])*(C[1]-A[1])-(B[1]-A[1])*(C[0]-A[0]));
-    if(proj<1e-8) return;
-    const cx=(A[0]+B[0]+C[0])/3, cy=(A[1]+B[1]+C[1])/3;
-    const terr=terrainZAtModelXY(t,cx,cy);
-    if(Math.max(A[2],B[2],C[2])<=terr+0.02) return;
-    const mesh=trianglePrismMesh(A,B,C,baseZ,Mesh);
-    solids.push(new Manifold(mesh));
-    prismCount++;
-  };
-  for(let i=0;i+8<buildingTriangles.length;i+=9){
-    const src=[
-      [buildingTriangles[i],buildingTriangles[i+1],buildingTriangles[i+2]],
-      [buildingTriangles[i+3],buildingTriangles[i+4],buildingTriangles[i+5]],
-      [buildingTriangles[i+6],buildingTriangles[i+7],buildingTriangles[i+8]]
-    ];
-    const proj=Math.abs((src[1][0]-src[0][0])*(src[2][1]-src[0][1])-(src[1][1]-src[0][1])*(src[2][0]-src[0][0]));
-    if(proj<1e-8) continue; // reine Fassadenfläche: Wand entsteht aus Dachvolumen automatisch
-    sourceTriangles++;
-    const poly=src.every(p=>pointInsideRoundedRect(p[0],p[1],t.dims.widthMm,t.dims.depthMm)) ? src : clipPolyAgainstConvexXY(src,clip);
-    for(let j=1;j<poly.length-1;j++) pushPrism(poly[0],poly[j],poly[j+1]);
-  }
-  if(!solids.length) return {solid:null,prisms:0,sourceTriangles};
-
-  // CAD-Union in Batches: jede Dachfläche wird als echter geschlossener Prismenkörper
-  // erzeugt. Die Union entfernt alle inneren Flächen und rekonstruiert die Fassaden
-  // ausschließlich als Außenhaut des Volumens.
-  let current=solids;
-  while(current.length>1){
-    const next=[];
-    for(let i=0;i<current.length;i+=128){
-      const batch=current.slice(i,i+128);
-      const united=batch.length===1?batch[0]:Manifold.union(batch);
-      next.push(united);
-      if(batch.length>1) for(const x of batch) x.delete?.();
-    }
-    current=next;
-  }
-  return {solid:current[0],prisms:prismCount,sourceTriangles};
-}
 
 function manifoldMeshToBinaryStl(mesh){
   const vp=mesh.vertProperties, tv=mesh.triVerts, stride=mesh.numProp||3;
@@ -2865,41 +2582,92 @@ function manifoldMeshToBinaryStl(mesh){
   return new Blob([buffer],{type:'model/stl'});
 }
 
-async function buildBinaryStl(t, buildingTriangles = null) {
-  setStatus('Gemeinsame Terrain-/Gebäudeoberfläche aufbauen', 99);
-  // v9.1: Terrain und Gebäude werden als EIN 2.5D-Höhenkörper erzeugt.
-  // Es gibt keine separaten Gebäudeschalen und keine nachträgliche Boolean-Union.
-  // Dadurch kann kein Gebäude ausserhalb des Reliefkörpers liegen und die
-  // Manifold-Eigenschaft folgt direkt aus der gemeinsamen Topologie.
-  const meshData=buildTerrainIndexedSolid(t,buildingTriangles);
-  debug(`Relief-/Gebäude-Topologie: MANIFOLD · 0 offene · 0 mehrfach belegte Kanten · ${meshData.boundaryVertices.toLocaleString('de-CH')} gemeinsame Randvertices.`);
-  if(buildingTriangles?.length){
-    debug(`Gebäude-Höhenhülle (exakt am Footprint geclippt): ${meshData.buildingHF.roofTriangles.toLocaleString('de-CH')} Dachflächen rasterisiert · ${meshData.buildingHF.coveredVertices.toLocaleString('de-CH')} Terrainvertices durch Gebäudehöhen ersetzt. Keine separaten Gebäudekörper.`);
+
+async function buildActualBuildingManifold(buildingTriangles, wasm) {
+  if(!buildingTriangles?.length) return {solid:null, sourceTriangles:0, caps:0, check:{ok:true,open:0,multi:0}};
+  const {Manifold,Mesh}=wasm;
+  const SCALE=100; // 0.01 mm: identische Gebäudekanten verschweissen
+  const verts=[]; const tris=[]; const vmap=new Map(); const triSeen=new Set();
+  const vid=(x,y,z)=>{
+    const k=`${Math.round(x*SCALE)},${Math.round(y*SCALE)},${Math.round(z*SCALE)}`;
+    let i=vmap.get(k); if(i!=null) return i;
+    i=verts.length/3; verts.push(x,y,z); vmap.set(k,i); return i;
+  };
+  for(let i=0;i+8<buildingTriangles.length;i+=9){
+    const a=vid(buildingTriangles[i],buildingTriangles[i+1],buildingTriangles[i+2]);
+    const b=vid(buildingTriangles[i+3],buildingTriangles[i+4],buildingTriangles[i+5]);
+    const c=vid(buildingTriangles[i+6],buildingTriangles[i+7],buildingTriangles[i+8]);
+    if(a===b||b===c||c===a) continue;
+    const key=[a,b,c].sort((x,y)=>x-y).join('|');
+    if(triSeen.has(key)) continue; triSeen.add(key); tris.push([a,b,c]);
   }
-  return indexedMeshToBinaryStl(meshData);
+  const edgeKey=(a,b)=>a<b?`${a}|${b}`:`${b}|${a}`;
+  let capCount=0;
+  for(let pass=0;pass<4;pass++){
+    const edges=new Map();
+    const add=(a,b,ti)=>{const k=edgeKey(a,b);let e=edges.get(k);if(!e){e={a,b,uses:[]};edges.set(k,e);}e.uses.push(ti);};
+    tris.forEach((t,ti)=>{add(t[0],t[1],ti);add(t[1],t[2],ti);add(t[2],t[0],ti);});
+    const bedges=[...edges.values()].filter(e=>e.uses.length===1);
+    if(!bedges.length) break;
+    const adj=new Map(); const ae=(a,b)=>{if(!adj.has(a))adj.set(a,[]);adj.get(a).push(b);};
+    bedges.forEach(e=>{ae(e.a,e.b);ae(e.b,e.a);});
+    const used=new Set(); let added=0;
+    for(const e0 of bedges){
+      const ek=edgeKey(e0.a,e0.b); if(used.has(ek)) continue;
+      const loop=[e0.a]; let prev=e0.a,curr=e0.b; used.add(ek); let closed=false;
+      for(let guard=0;guard<100000;guard++){
+        loop.push(curr); const ns=[...(new Set(adj.get(curr)||[]))].filter(n=>n!==prev);
+        let next=null; for(const n of ns){if(!used.has(edgeKey(curr,n))){next=n;break;}}
+        if(next==null){closed=(curr===loop[0]);break;}
+        used.add(edgeKey(curr,next)); prev=curr; curr=next;
+        if(curr===loop[0]){closed=true;break;}
+      }
+      if(!closed || loop.length<3) continue;
+      if(loop[loop.length-1]===loop[0]) loop.pop();
+      const spans=[0,1,2].map(ax=>{const a=loop.map(i=>verts[i*3+ax]);return Math.max(...a)-Math.min(...a);});
+      const drop=spans.indexOf(Math.min(...spans));
+      const pts=loop.map(i=>{const p=[verts[i*3],verts[i*3+1],verts[i*3+2]];return drop===0?new THREE.Vector2(p[1],p[2]):drop===1?new THREE.Vector2(p[0],p[2]):new THREE.Vector2(p[0],p[1]);});
+      const tt=THREE.ShapeUtils.triangulateShape(pts,[]);
+      for(const q of tt){tris.push([loop[q[0]],loop[q[1]],loop[q[2]]]);capCount++;added++;}
+    }
+    if(!added) break;
+  }
+  // Konsistente Orientierung über gemeinsam benutzte Kanten.
+  const edgeUses=new Map();
+  tris.forEach((t,ti)=>{for(const [a,b] of [[t[0],t[1]],[t[1],t[2]],[t[2],t[0]]]){const k=edgeKey(a,b);if(!edgeUses.has(k))edgeUses.set(k,[]);edgeUses.get(k).push({ti,a,b});}});
+  const nbr=Array.from({length:tris.length},()=>[]);
+  for(const uses of edgeUses.values()) if(uses.length===2){const u=uses[0],v=uses[1];nbr[u.ti].push({j:v.ti,same:u.a===v.a&&u.b===v.b});nbr[v.ti].push({j:u.ti,same:u.a===v.a&&u.b===v.b});}
+  const flip=new Int8Array(tris.length); flip.fill(-1);
+  for(let seed=0;seed<tris.length;seed++) if(flip[seed]<0){flip[seed]=0;const q=[seed];while(q.length){const i=q.pop();for(const e of nbr[i]){const want=flip[i]^(e.same?1:0);if(flip[e.j]<0){flip[e.j]=want;q.push(e.j);}}}}
+  for(let i=0;i<tris.length;i++) if(flip[i]) [tris[i][1],tris[i][2]]=[tris[i][2],tris[i][1]];
+  // Jede zusammenhängende Komponente nach außen orientieren (positives Volumen).
+  const seen=new Uint8Array(tris.length);
+  for(let seed=0;seed<tris.length;seed++) if(!seen[seed]){let vol=0;const comp=[];const q=[seed];seen[seed]=1;while(q.length){const i=q.pop();comp.push(i);const t=tris[i],A=[verts[t[0]*3],verts[t[0]*3+1],verts[t[0]*3+2]],B=[verts[t[1]*3],verts[t[1]*3+1],verts[t[1]*3+2]],C=[verts[t[2]*3],verts[t[2]*3+1],verts[t[2]*3+2]];vol+=(A[0]*(B[1]*C[2]-B[2]*C[1])-A[1]*(B[0]*C[2]-B[2]*C[0])+A[2]*(B[0]*C[1]-B[1]*C[0]))/6;for(const e of nbr[i])if(!seen[e.j]){seen[e.j]=1;q.push(e.j);}}if(vol<0)for(const i of comp)[tris[i][1],tris[i][2]]=[tris[i][2],tris[i][1]];}
+  const triVerts=new Uint32Array(tris.flat());
+  const check=validateIndexedManifold(triVerts);
+  if(!check.ok) throw new Error(`Gebäudehülle nicht geschlossen: ${check.open} offene / ${check.multi} mehrfach belegte Kanten.`);
+  const mesh=new Mesh({numProp:3,vertProperties:new Float32Array(verts),triVerts});
+  return {solid:new Manifold(mesh),sourceTriangles:Math.floor(buildingTriangles.length/9),caps:capCount,check};
 }
 
-function indexedMeshToBinaryStl(mesh){
-  const vp=mesh.vertProperties, tv=mesh.triVerts, stride=3;
-  const triCount=Math.floor(tv.length/3);
-  const buffer=new ArrayBuffer(84+triCount*50);
-  const view=new DataView(buffer);
-  const header=new TextEncoder().encode('Swiss Relief STL Generator v9.2 · exact footprint roof clipping · swisstopo');
-  new Uint8Array(buffer,0,Math.min(80,header.length)).set(header.slice(0,80));
-  view.setUint32(80,triCount,true);
-  let off=84;
-  const P=(idx)=>[vp[idx*stride],vp[idx*stride+1],vp[idx*stride+2]];
-  for(let i=0;i<tv.length;i+=3){
-    const a=P(tv[i]),b=P(tv[i+1]),c=P(tv[i+2]);
-    const ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2];
-    const vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
-    let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
-    const len=Math.hypot(nx,ny,nz)||1; nx/=len;ny/=len;nz/=len;
-    for(const n of [nx,ny,nz]){view.setFloat32(off,n,true);off+=4;}
-    for(const p of [a,b,c]) for(const n of p){view.setFloat32(off,n,true);off+=4;}
-    view.setUint16(off,0,true);off+=2;
+async function buildBinaryStl(t, buildingTriangles = null) {
+  setStatus('Geschlossenen Reliefkörper aufbauen',99);
+  const terrainMeshData=buildTerrainIndexedSolid(t);
+  const wasm=await getManifoldModule();
+  const {Manifold,Mesh}=wasm;
+  const terrainSolid=new Manifold(new Mesh({numProp:3,vertProperties:terrainMeshData.vertProperties,triVerts:terrainMeshData.triVerts}));
+  let finalSolid=terrainSolid;
+  if(buildingTriangles?.length){
+    setStatus('Echte 3D-Gebäude vereinigen',99);
+    const b=await buildActualBuildingManifold(buildingTriangles,wasm);
+    if(b.solid){finalSolid=terrainSolid.add(b.solid);terrainSolid.delete?.();b.solid.delete?.();}
+    debug(`Gebäude-Volumen v9.3: ${b.sourceTriangles.toLocaleString('de-CH')} echte Dach-/Fassadendreiecke · ${b.caps.toLocaleString('de-CH')} Lochschluss-Dreiecke · Gebäudehülle vor Union MANIFOLD.`);
   }
-  return new Blob([buffer],{type:'model/stl'});
+  const finalMesh=finalSolid.getMesh();
+  const check=validateIndexedManifold(finalMesh.triVerts);
+  debug(`Finale STL-Topologie: ${check.ok?'MANIFOLD':'FEHLER'} · offene Kanten ${check.open} · mehrfach belegte Kanten ${check.multi}.`);
+  if(!check.ok) throw new Error(`Interner CAD-Fehler: finale Union nicht manifold (${check.open}/${check.multi}).`);
+  const blob=manifoldMeshToBinaryStl(finalMesh); finalSolid.delete?.(); return blob;
 }
 
 function fileName() {
